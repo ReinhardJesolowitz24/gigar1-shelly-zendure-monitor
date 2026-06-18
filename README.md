@@ -13,6 +13,13 @@ board supervising a more complex one — the *checker* is independent of the *do
 > **Read-only:** the sketch never writes to the Zendure, so it does not disturb the
 > device's own cloud/HEMS control.
 
+![Shelly Pro 3EM + Zendure monitor on an Arduino GIGA R1](docs/ShellyMonitor.jpg)
+
+*Live grid power (total + per phase L1/L2/L3), Zendure SoC, daily kWh balance, and the
+independent watchdog: per-type event counters (here `BMS 1 / Warn 2`) plus a yellow,
+non-blocking BMS warning. Red counters/frame = critical event, yellow = harmless flag
+(e.g. cell balancing at 100 % SoC). Green dot = heartbeat (sketch alive).*
+
 ## Features
 
 - **Grid power** live: total + per phase L1/L2/L3 (W / V / A)
