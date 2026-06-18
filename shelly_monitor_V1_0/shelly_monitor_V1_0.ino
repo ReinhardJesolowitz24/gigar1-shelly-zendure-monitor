@@ -97,6 +97,15 @@ const char* alarmText = "";
 bool dumpPrev = false, socPrev = false, faultPrev = false;   // Flankenerkennung
 unsigned int cntDump = 0, cntSoc = 0, cntFault = 0;          // Ereigniszaehler (Reset nur bei Neustart)
 
+// Differenzierung: gelbe Warnung (faultLevel) vs roter Kritisch-Alarm
+bool warnActive = false, warnPrev = false;
+const char* warnText = "";
+unsigned int cntWarn = 0;
+int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
+const int CELL_MAX_CRIT = 360;    // 3.60 V Ueberspannung (Einheit 0.01 V)
+const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
+const int TEMP_MAX_CRIT = 3231;   // ~50 C (Einheit Kelvin*10)
+
 // Spalten fuer die Phasen-Tabelle
 const int CX_LBL = 25;
 const int CX_L1  = 250;
@@ -192,9 +201,11 @@ void drawStatus(const char* text, uint16_t color) {
 
 void drawCounters() {
   display.fillRect(0, 424, SCREEN_W, 16, COL_BG);
-  char buf[72];
-  snprintf(buf, sizeof(buf), "Alarme seit Start:   BMS %u    Tief %u    Netz %u", cntFault, cntSoc, cntDump);
-  uint16_t col = (cntFault || cntSoc || cntDump) ? COL_ZEN : COL_UNIT;   // gelb, falls je ein Alarm war
+  char buf[80];
+  snprintf(buf, sizeof(buf), "Alarme seit Start:   BMS %u   Tief %u   Netz %u   Warn %u", cntFault, cntSoc, cntDump, cntWarn);
+  uint16_t col = COL_UNIT;
+  if (cntFault || cntSoc || cntDump) col = COL_BEZUG;   // es gab einen Rot-Alarm
+  else if (cntWarn) col = COL_ZEN;                       // nur Warnungen
   printCentered(buf, 424, 2, col);
 }
 
@@ -214,20 +225,37 @@ void evalAlarm(unsigned long now) {
   // 2) Tiefentladung: SoC unter Schwelle
   bool socAlarm = (zSoc >= 0) && (zSoc < SOC_MIN_ALARM);
 
-  // 3) BMS meldet Fehler
-  bool faultAlarm = (zFault != 0) || (zErr != 0);
+  // 3) BMS kritisch: harter Fehler ODER unabhaengig gepruefte Zell-/Temp-Grenzwerte
+  bool overV  = (cellMax > CELL_MAX_CRIT);
+  bool underV = (cellMin > 0 && cellMin < CELL_MIN_CRIT);
+  bool overT  = (tempMax > TEMP_MAX_CRIT);
+  bool bmsCrit = (zErr != 0) || overV || underV || overT;
+
+  // 4) GELB: faultLevel-Warnflag, aber kein harter/kritischer Fehler
+  bool warn = (zFault != 0) && !bmsCrit;
 
   // Ereignisse zaehlen: nur bei Flanke inaktiv -> aktiv
-  if (dumpAlarm  && !dumpPrev)  cntDump++;
-  if (socAlarm   && !socPrev)   cntSoc++;
-  if (faultAlarm && !faultPrev) cntFault++;
-  dumpPrev = dumpAlarm; socPrev = socAlarm; faultPrev = faultAlarm;
+  if (dumpAlarm && !dumpPrev)  cntDump++;
+  if (socAlarm  && !socPrev)   cntSoc++;
+  if (bmsCrit   && !faultPrev) cntFault++;
+  if (warn      && !warnPrev)  cntWarn++;
+  dumpPrev = dumpAlarm; socPrev = socAlarm; faultPrev = bmsCrit; warnPrev = warn;
 
-  // Prioritaet: BMS-Fehler > Tiefentladung > Dumping
-  if (faultAlarm)     { alarmActive = true;  alarmText = "!! BATTERIE-FEHLER (BMS) !!"; }
-  else if (socAlarm)  { alarmActive = true;  alarmText = "!! SoC UNTER 30% - TIEFENTLADUNG !!"; }
-  else if (dumpAlarm) { alarmActive = true;  alarmText = "!! AKKU SPEIST INS NETZ - HEMS-FEHLER !!"; }
+  // Rot-Alarm (Prioritaet): BMS-kritisch > Tiefentladung > Dumping
+  if (bmsCrit) {
+    alarmActive = true;
+    if      (zErr != 0) alarmText = "!! BMS HARD-FEHLER !!";
+    else if (overV)     alarmText = "!! ZELLE UEBERSPANNUNG !!";
+    else if (underV)    alarmText = "!! ZELLE UNTERSPANNUNG !!";
+    else                alarmText = "!! BATTERIE UEBERTEMPERATUR !!";
+  }
+  else if (socAlarm)  { alarmActive = true; alarmText = "!! SoC UNTER 30% - TIEFENTLADUNG !!"; }
+  else if (dumpAlarm) { alarmActive = true; alarmText = "!! AKKU SPEIST INS NETZ - HEMS-FEHLER !!"; }
   else                { alarmActive = false; }
+
+  // Gelb-Warnung (Info, nicht blockierend)
+  warnActive = warn;
+  if (warn) { static char wbuf[40]; snprintf(wbuf, sizeof(wbuf), "BMS-Warnung (faultLevel=%d)", zFault); warnText = wbuf; }
 }
 
 void repaintAll() {
@@ -290,6 +318,20 @@ bool fetchZendure() {
   zAc    = pr["acStatus"] | -1;
   zFault = pr["faultLevel"] | 0;
   zErr   = pr["is_error"] | 0;
+
+  // Pack-Werte (worst-case ueber alle Packs) fuer unabhaengigen Kritisch-Check
+  cellMax = 0; cellMin = 9999; tempMax = 0;
+  JsonArray pd = doc["packData"];
+  if (!pd.isNull()) {
+    for (JsonObject pk : pd) {
+      int mv = pk["maxVol"] | 0;
+      int nv = pk["minVol"] | 0;
+      int mt = pk["maxTemp"] | 0;
+      if (mv > cellMax) cellMax = mv;
+      if (nv > 0 && nv < cellMin) cellMin = nv;
+      if (mt > tempMax) tempMax = mt;
+    }
+  }
   return true;
 }
 
@@ -359,8 +401,8 @@ void loop() {
       evalAlarm(now);
       drawCounters();
       if (!alarmActive) {
-        char st[40]; snprintf(st, sizeof(st), "Monitor  |  Laufzeit %lus", now / 1000);
-        drawStatus(st, COL_UNIT);
+        if (warnActive) drawStatus(warnText, COL_ZEN);   // gelbe BMS-Warnung (nicht blockierend)
+        else { char st[40]; snprintf(st, sizeof(st), "Monitor  |  Laufzeit %lus", now / 1000); drawStatus(st, COL_UNIT); }
       }
     } else drawStatus("Shelly-Fehler!", COL_BEZUG);
   }
