@@ -52,8 +52,17 @@ non-blocking BMS warning. Red counters/frame = critical event, yellow = harmless
 
 1. Copy `shelly_monitor_V1_0/arduino_secrets.example.h` →
    `shelly_monitor_V1_0/arduino_secrets.h`
-2. Fill in your WiFi credentials and the **local IPs** of your Shelly and Zendure.
-3. Open `shelly_monitor_V1_0/shelly_monitor_V1_0.ino` in the Arduino IDE, select the
+2. Open `arduino_secrets.h` and fill in **all four** values for your network:
+   - `SECRET_SSID` — your WiFi name
+   - `SECRET_PASS` — your WiFi password
+   - `SECRET_SHELLY_HOST` — the **local IP** of your Shelly Pro 3EM
+   - `SECRET_ZEN_HOST` — the **local IP** of your Zendure SolarFlow
+
+   Find the device IPs in your router's device / DHCP-client list, or in the Shelly /
+   Zendure apps. **Recommended:** give each device a fixed IP (DHCP reservation in your
+   router) so the addresses don't change later and break the monitor.
+3. Install the required libraries (see [Libraries](#libraries)).
+4. Open `shelly_monitor_V1_0/shelly_monitor_V1_0.ino` in the Arduino IDE, select the
    **Arduino GIGA R1** board, and upload.
 
 `arduino_secrets.h` is git-ignored — your credentials are never committed.
