@@ -265,8 +265,27 @@ void repaintAll() {
 // ───────────────────────────────────────────────────────────────────────────
 void connectWiFi() {
   drawStatus("Verbinde mit WLAN...", COL_TITLE);
+  unsigned long t0 = millis();        // Start dieses Verbindungsversuchs
+  unsigned long tBegin = millis();    // Zeitpunkt des letzten WiFi.begin()
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); if (wdtActive) mbed::Watchdog::get_instance().kick(); }
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    if (wdtActive) mbed::Watchdog::get_instance().kick();
+
+    // Alle 12 s frischer Versuch (Modul aus haengendem Zustand holen)
+    if (millis() - tBegin >= 12000) {
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      tBegin = millis();
+    }
+
+    // Im Betrieb: nach 90 s erfolglosem Reconnect Board neu starten lassen
+    // (Watchdog NICHT mehr fuettern -> automatischer Reset, wie ein HW-Reset)
+    if (wdtActive && (millis() - t0 >= 90000)) {
+      drawStatus("Reconnect fehlgeschlagen -> Neustart", COL_BEZUG);
+      while (true) { }   // Watchdog loest den Reboot aus
+    }
+  }
   drawStatus("WLAN verbunden", COL_EINSPEIS);
 }
 
