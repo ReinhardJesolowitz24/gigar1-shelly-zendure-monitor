@@ -102,7 +102,7 @@ bool warnActive = false, warnPrev = false;
 const char* warnText = "";
 unsigned int cntWarn = 0;
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
-const int CELL_MAX_CRIT = 360;    // 3.60 V Ueberspannung (Einheit 0.01 V)
+const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
 const int TEMP_MAX_CRIT = 3231;   // ~50 C (Einheit Kelvin*10)
 
