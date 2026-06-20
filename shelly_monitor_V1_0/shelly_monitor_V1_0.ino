@@ -103,6 +103,7 @@ const char* warnText = "";
 unsigned int cntWarn = 0;
 bool balanceActive = false, balancePrev = false;
 unsigned int cntBalance = 0;
+int balSpread = 0, balSpreadMax = 0;   // Zellspreizung beim Balancing (mV): letzte + groesste je gesehene
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -244,7 +245,13 @@ void evalAlarm(unsigned long now) {
   if (dumpAlarm  && !dumpPrev)    cntDump++;
   if (socAlarm   && !socPrev)     cntSoc++;
   if (bmsCrit    && !faultPrev)   cntFault++;
-  if (isBalance  && !balancePrev) cntBalance++;
+  if (isBalance  && !balancePrev) {
+    cntBalance++;
+    balSpread = (cellMax - cellMin) * 10;                 // mV (Einheit 0.01 V -> *10)
+    if (balSpread > balSpreadMax) balSpreadMax = balSpread;
+    char cb[80]; snprintf(cb, sizeof(cb), "CSV,BAL,%s,%d,%d,%d,%d", curTime.c_str(), zSoc, cellMax, cellMin, balSpread);
+    Serial.println(cb);                                   // Langzeit-Log: Zeit, SoC, maxZelle, minZelle, Spreizung_mV
+  }
   if (isWarn     && !warnPrev)    cntWarn++;
   dumpPrev = dumpAlarm; socPrev = socAlarm; faultPrev = bmsCrit; balancePrev = isBalance; warnPrev = isWarn;
 
@@ -412,6 +419,7 @@ void setup() {
   mbed::Watchdog::get_instance().start(toMs);
   wdtActive = true;
   Serial.print("Watchdog aktiv, Timeout (ms): "); Serial.println(toMs);
+  Serial.println("CSV,BAL,time,soc,cellMax,cellMin,spread_mV");   // Kopfzeile fuers Balancing-Log
 }
 
 void loop() {
@@ -429,7 +437,7 @@ void loop() {
       drawCounters();
       if (!alarmActive) {
         if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
-        else if (balanceActive) drawStatus("Zell-Balancing (faultLevel=2)", COL_TITLE); // blau: harmlos
+        else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
         else { char st[40]; snprintf(st, sizeof(st), "Monitor  |  Laufzeit %lus", now / 1000); drawStatus(st, COL_UNIT); }
       }
     } else drawStatus("Shelly-Fehler!", COL_BEZUG);
