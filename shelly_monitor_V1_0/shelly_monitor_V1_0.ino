@@ -78,6 +78,7 @@ int   zSoc=-1, zOut=0, zAc=-1;
 
 // Zeit + Tagessaldo
 String curTime = "--:--";
+String myIp = "0.0.0.0";            // eigene IP der GIGA (fuer Anzeige)
 int    prevMod = -1;               // vorheriger Minute-im-Tag-Wert (Mitternacht-Erkennung)
 double impWh=0, retWh=0;           // aktuelle Zaehlerstaende (Wh)
 double impBase=0, retBase=0;       // Basis seit 0:00 Uhr
@@ -319,7 +320,8 @@ void connectWiFi() {
       while (true) { }   // Watchdog loest den Reboot aus
     }
   }
-  drawStatus("WLAN verbunden", COL_EINSPEIS);
+  myIp = WiFi.localIP().toString();
+  drawStatus(("WLAN verbunden  " + myIp).c_str(), COL_EINSPEIS);
 }
 
 bool httpGetBody(const char* host, int port, const char* path, String& body) {
@@ -518,7 +520,7 @@ void loop() {
       if (!alarmActive) {
         if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
         else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
-        else { char st[40]; snprintf(st, sizeof(st), "Monitor  |  Laufzeit %lus", now / 1000); drawStatus(st, COL_UNIT); }
+        else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
       }
     } else drawStatus("Shelly-Fehler!", COL_BEZUG);
   }
