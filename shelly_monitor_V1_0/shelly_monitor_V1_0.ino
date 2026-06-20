@@ -116,11 +116,12 @@ int balStored = 0;    // belegte Eintraege (max BAL_HIST)
 
 // Tagessaldo-Historie (Ringpuffer der letzten 30 Tage)
 unsigned long sysEpoch = 0;   // Unixzeit vom Shelly (Datums-Stempel)
-struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; };
+struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; unsigned int bms, tief, netz, bal, warn; };
 const int DAY_HIST = 30;
 DayRec dayHist[DAY_HIST];
 int dayHead = 0, dayStored = 0;
 unsigned int dayCount = 0;
+unsigned int pbms = 0, ptief = 0, pnetz = 0, pbal = 0, pwarn = 0;   // Zaehler-Snapshot der letzten Mitternacht
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -425,6 +426,12 @@ bool fetchSlow() {
       dayHist[dayHead].bezug = (impWh - impBase) / 1000.0;
       dayHist[dayHead].einsp = (retWh - retBase) / 1000.0;
       dayHist[dayHead].saldo = dayHist[dayHead].einsp - dayHist[dayHead].bezug;
+      dayHist[dayHead].bms  = cntFault   - pbms;     // Ereignisse an DIESEM Tag (Delta)
+      dayHist[dayHead].tief = cntSoc     - ptief;
+      dayHist[dayHead].netz = cntDump    - pnetz;
+      dayHist[dayHead].bal  = cntBalance - pbal;
+      dayHist[dayHead].warn = cntWarn    - pwarn;
+      pbms = cntFault; ptief = cntSoc; pnetz = cntDump; pbal = cntBalance; pwarn = cntWarn;
       dayHead = (dayHead + 1) % DAY_HIST;
       if (dayStored < DAY_HIST) dayStored++;
       impBase = impWh; retBase = retWh;
@@ -494,6 +501,11 @@ void sendJsonDaily(WiFiClient& c) {
     c.print(",\"saldo_kwh\":");   c.print(dayHist[idx].saldo, 3);
     c.print(",\"bezug_kwh\":");   c.print(dayHist[idx].bezug, 3);
     c.print(",\"einsp_kwh\":");   c.print(dayHist[idx].einsp, 3);
+    c.print(",\"bms\":");   c.print(dayHist[idx].bms);
+    c.print(",\"tief\":");  c.print(dayHist[idx].tief);
+    c.print(",\"netz\":");  c.print(dayHist[idx].netz);
+    c.print(",\"bal\":");   c.print(dayHist[idx].bal);
+    c.print(",\"warn\":");  c.print(dayHist[idx].warn);
     c.print("}");
   }
   c.print("]}");
