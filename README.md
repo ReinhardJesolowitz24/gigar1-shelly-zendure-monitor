@@ -34,6 +34,8 @@ non-blocking BMS warning. Red counters/frame = critical event, yellow = harmless
   with per-type **event counters** (persist until restart)
 - **Heartbeat dot** + **hardware watchdog** — the sketch supervises itself and
   auto-recovers from a freeze
+- **JSON API over WiFi** — query live values and the cell-balancing history from any
+  device on the LAN (`/status`, `/balance`), no serial cable needed
 
 ## Hardware
 
@@ -78,6 +80,18 @@ non-blocking BMS warning. Red counters/frame = critical event, yellow = harmless
 - **Sign convention:** the raw Shelly value is inverted (`* -1`), so in this sketch
   **negative = grid draw (Bezug)**, **positive = feed-in (Einspeisung)**. If your CT
   clamps are mounted the other way round, remove the `* -1`.
+
+## JSON API
+
+The board serves its own data over HTTP, so you can log and plot it from any device on
+the LAN — no serial cable required:
+
+- `http://<board-ip>/status` — live values + event counters + record cell spread (JSON)
+- `http://<board-ip>/balance` — ring buffer of the last 64 cell-balancing events
+  (time, SoC, cell max/min, spread in mV)
+
+Poll it from Home Assistant, Node-RED, a cron job, etc. A cell spread that grows over
+weeks is an early indicator of cell drift / aging.
 
 ## ⚠️ Disclaimer
 

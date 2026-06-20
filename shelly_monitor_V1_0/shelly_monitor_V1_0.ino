@@ -104,6 +104,14 @@ unsigned int cntWarn = 0;
 bool balanceActive = false, balancePrev = false;
 unsigned int cntBalance = 0;
 int balSpread = 0, balSpreadMax = 0;   // Zellspreizung beim Balancing (mV): letzte + groesste je gesehene
+
+// JSON-API (eigener HTTP-Server)
+WiFiServer apiServer(80);
+struct BalEvent { unsigned int id; char tm[8]; int soc; int cMax; int cMin; int spread; };
+const int BAL_HIST = 64;
+BalEvent balHist[BAL_HIST];
+int balHead = 0;      // naechster Schreibindex im Ring
+int balStored = 0;    // belegte Eintraege (max BAL_HIST)
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -251,6 +259,16 @@ void evalAlarm(unsigned long now) {
     if (balSpread > balSpreadMax) balSpreadMax = balSpread;
     char cb[80]; snprintf(cb, sizeof(cb), "CSV,BAL,%s,%d,%d,%d,%d", curTime.c_str(), zSoc, cellMax, cellMin, balSpread);
     Serial.println(cb);                                   // Langzeit-Log: Zeit, SoC, maxZelle, minZelle, Spreizung_mV
+    // Ring-Puffer fuer die JSON-API
+    balHist[balHead].id     = cntBalance;
+    strncpy(balHist[balHead].tm, curTime.c_str(), sizeof(balHist[balHead].tm) - 1);
+    balHist[balHead].tm[sizeof(balHist[balHead].tm) - 1] = 0;
+    balHist[balHead].soc    = zSoc;
+    balHist[balHead].cMax   = cellMax;
+    balHist[balHead].cMin   = cellMin;
+    balHist[balHead].spread = balSpread;
+    balHead = (balHead + 1) % BAL_HIST;
+    if (balStored < BAL_HIST) balStored++;
   }
   if (isWarn     && !warnPrev)    cntWarn++;
   dumpPrev = dumpAlarm; socPrev = socAlarm; faultPrev = bmsCrit; balancePrev = isBalance; warnPrev = isWarn;
@@ -398,6 +416,66 @@ bool fetchSlow() {
   return true;
 }
 
+// ── JSON-API (HTTP-Server) ────────────────────────────────────────────────────
+void sendJsonStatus(WiFiClient& c) {
+  c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+  c.print("{\"uptime_s\":");      c.print(millis() / 1000);
+  c.print(",\"time\":\"");        c.print(curTime); c.print("\"");
+  c.print(",\"netz_w\":");        c.print(gTotal, 0);
+  c.print(",\"saldo_kwh\":");     c.print(saldoKwh, 3);
+  c.print(",\"bezug_kwh\":");     c.print(bezugKwh, 3);
+  c.print(",\"einsp_kwh\":");     c.print(einspKwh, 3);
+  c.print(",\"soc\":");           c.print(zSoc);
+  c.print(",\"zout_w\":");        c.print(zOut);
+  c.print(",\"faultlevel\":");    c.print(zFault);
+  c.print(",\"is_error\":");      c.print(zErr);
+  c.print(",\"spread_max_mv\":"); c.print(balSpreadMax);
+  c.print(",\"cnt_bms\":");       c.print(cntFault);
+  c.print(",\"cnt_tief\":");      c.print(cntSoc);
+  c.print(",\"cnt_netz\":");      c.print(cntDump);
+  c.print(",\"cnt_bal\":");       c.print(cntBalance);
+  c.print(",\"cnt_warn\":");      c.print(cntWarn);
+  c.print("}");
+}
+
+void sendJsonBalance(WiFiClient& c) {
+  c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+  c.print("{\"count\":"); c.print(cntBalance);
+  c.print(",\"stored\":"); c.print(balStored);
+  c.print(",\"events\":[");
+  int start = (balStored < BAL_HIST) ? 0 : balHead;     // aeltester Eintrag zuerst
+  for (int i = 0; i < balStored; i++) {
+    int idx = (start + i) % BAL_HIST;
+    if (i) c.print(",");
+    c.print("{\"id\":");        c.print(balHist[idx].id);
+    c.print(",\"time\":\"");    c.print(balHist[idx].tm); c.print("\"");
+    c.print(",\"soc\":");       c.print(balHist[idx].soc);
+    c.print(",\"cellmax\":");   c.print(balHist[idx].cMax);
+    c.print(",\"cellmin\":");   c.print(balHist[idx].cMin);
+    c.print(",\"spread_mv\":"); c.print(balHist[idx].spread);
+    c.print("}");
+  }
+  c.print("]}");
+}
+
+void handleApi() {
+  WiFiClient c = apiServer.available();
+  if (!c) return;
+  c.setTimeout(800);
+  unsigned long t = millis();
+  while (!c.available() && millis() - t < 800) delay(1);
+  String req = c.readStringUntil('\n');                 // "GET /pfad HTTP/1.1"
+  while (c.connected() && c.available()) { String l = c.readStringUntil('\n'); if (l.length() <= 1) break; }
+  if      (req.indexOf("/balance") >= 0) sendJsonBalance(c);
+  else if (req.indexOf("/status")  >= 0) sendJsonStatus(c);
+  else {
+    c.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+    c.print("ShellyMonitor API:  /status   /balance");
+  }
+  delay(2);
+  c.stop();
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -409,6 +487,7 @@ void setup() {
   drawSaldo();
   drawCounters();
   connectWiFi();   // OHNE Watchdog -> beliebig viel Zeit fuer die Erstverbindung
+  apiServer.begin();   // JSON-API starten (nach WLAN-Verbindung)
 
   // Hardware-Watchdog ERST JETZT starten (nach erfolgreicher WLAN-Verbindung),
   // damit ein langsamer Verbindungsaufbau keinen Reboot-Loop ausloest.
@@ -424,6 +503,7 @@ void setup() {
 
 void loop() {
   mbed::Watchdog::get_instance().kick();   // Watchdog fuettern (jeden Durchlauf)
+  handleApi();                             // JSON-API bedienen (nicht-blockierend)
   unsigned long now = millis();
 
   if (now - lastBeat >= BEAT_MS) { lastBeat = now; beatOn = !beatOn; drawHeartbeat(beatOn); }
