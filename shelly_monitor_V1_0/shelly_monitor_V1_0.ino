@@ -95,6 +95,11 @@ unsigned long anomSince = 0, lastBlink = 0;
 bool alarmActive = false, prevAlarm = false, blinkOn = false;
 const int DEBOUNCE_N = 3;          // Alarme erst nach N aufeinanderfolgenden Messungen (gegen Reboot-Transienten)
 int dbBms = 0, dbSoc = 0, dbBal = 0, dbWarn = 0;
+
+// Geraete-Health: 0=ok, 1=haengt (TCP ok, API nein), 2=offline (kein TCP)
+int shState = 0, znState = 0;
+unsigned int shOut = 0, znOut = 0;        // Ausfall-Episoden kumuliert (ok -> nicht-ok)
+unsigned int pshOut = 0, pznOut = 0;      // Snapshot der letzten Mitternacht
 int  zFault = 0, zErr = 0;                  // BMS faultLevel / is_error
 const char* alarmText = "";
 bool dumpPrev = false, socPrev = false, faultPrev = false;   // Flankenerkennung
@@ -118,7 +123,7 @@ int balStored = 0;    // belegte Eintraege (max BAL_HIST)
 
 // Tagessaldo-Historie (Ringpuffer der letzten 30 Tage)
 unsigned long sysEpoch = 0;   // Unixzeit vom Shelly (Datums-Stempel)
-struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; unsigned int bms, tief, netz, bal, warn; };
+struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; unsigned int bms, tief, netz, bal, warn, shout, znout; };
 const int DAY_HIST = 30;
 DayRec dayHist[DAY_HIST];
 int dayHead = 0, dayStored = 0;
@@ -203,8 +208,10 @@ void drawPhases() {
 void drawZendure() {
   display.fillRect(0, 300, SCREEN_W, 20, COL_BG);
   char buf[70];
-  if (zSoc < 0) snprintf(buf, sizeof(buf), "Zendure: (keine Antwort)");
-  else          snprintf(buf, sizeof(buf), "Zendure (HEMS):  SoC %d%%   Abgabe %d W   acStatus %d", zSoc, zOut, zAc);
+  if      (znState == 2) snprintf(buf, sizeof(buf), "Zendure: OFFLINE (kein TCP)");
+  else if (znState == 1) snprintf(buf, sizeof(buf), "Zendure: API haengt (Geraet laeuft)");
+  else if (zSoc < 0)     snprintf(buf, sizeof(buf), "Zendure: (keine Antwort)");
+  else                   snprintf(buf, sizeof(buf), "Zendure (HEMS):  SoC %d%%   Abgabe %d W   acStatus %d", zSoc, zOut, zAc);
   printCentered(buf, 302, 2, COL_ZEN);
 }
 
@@ -444,7 +451,10 @@ bool fetchSlow() {
       dayHist[dayHead].netz = cntDump    - pnetz;
       dayHist[dayHead].bal  = cntBalance - pbal;
       dayHist[dayHead].warn = cntWarn    - pwarn;
+      dayHist[dayHead].shout = shOut - pshOut;
+      dayHist[dayHead].znout = znOut - pznOut;
       pbms = cntFault; ptief = cntSoc; pnetz = cntDump; pbal = cntBalance; pwarn = cntWarn;
+      pshOut = shOut; pznOut = znOut;
       dayHead = (dayHead + 1) % DAY_HIST;
       if (dayStored < DAY_HIST) dayStored++;
       impBase = impWh; retBase = retWh;
@@ -459,6 +469,18 @@ bool fetchSlow() {
 }
 
 // ── JSON-API (HTTP-Server) ────────────────────────────────────────────────────
+int classifyFail(const char* host) {     // 1 = haengt (TCP ok, API nein), 2 = offline (kein TCP)
+  WiFiClient c; c.setTimeout(2000);
+  bool tcp = c.connect(host, 80);
+  c.stop();
+  return tcp ? 1 : 2;
+}
+void updateHealth(int& state, unsigned int& outCnt, bool apiOk, const char* host) {
+  int ns = apiOk ? 0 : classifyFail(host);
+  if (state == 0 && ns != 0) outCnt++;   // neue Ausfall-Episode (ok -> nicht-ok)
+  state = ns;
+}
+
 void sendJsonStatus(WiFiClient& c) {
   c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
   c.print("{\"uptime_s\":");      c.print(millis() / 1000);
@@ -477,6 +499,10 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"cnt_netz\":");      c.print(cntDump);
   c.print(",\"cnt_bal\":");       c.print(cntBalance);
   c.print(",\"cnt_warn\":");      c.print(cntWarn);
+  c.print(",\"shelly_state\":");  c.print(shState);
+  c.print(",\"zendure_state\":"); c.print(znState);
+  c.print(",\"shelly_out\":");    c.print(shOut);
+  c.print(",\"zendure_out\":");   c.print(znOut);
   c.print("}");
 }
 
@@ -519,6 +545,8 @@ void sendJsonDaily(WiFiClient& c) {
     c.print(",\"netz\":");  c.print(dayHist[idx].netz);
     c.print(",\"bal\":");   c.print(dayHist[idx].bal);
     c.print(",\"warn\":");  c.print(dayHist[idx].warn);
+    c.print(",\"shout\":"); c.print(dayHist[idx].shout);
+    c.print(",\"znout\":"); c.print(dayHist[idx].znout);
     c.print("}");
   }
   c.print("]}");
@@ -578,21 +606,25 @@ void loop() {
   if (now - lastPoll >= POLL_MS) {
     lastPoll = now;
     if (WiFi.status() != WL_CONNECTED) { drawStatus("WLAN getrennt...", COL_BEZUG); connectWiFi(); }
-    else if (fetchShelly()) {
-      drawTotal(gTotal); drawPhases();
-      evalAlarm(now);
-      drawCounters();
-      if (!alarmActive) {
-        if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
-        else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
-        else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
-      }
-    } else drawStatus("Shelly-Fehler!", COL_BEZUG);
+    else {
+      bool shOk = fetchShelly();
+      updateHealth(shState, shOut, shOk, SHELLY_HOST);
+      if (shOk) {
+        drawTotal(gTotal); drawPhases();
+        evalAlarm(now);
+        drawCounters();
+        if (!alarmActive) {
+          if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
+          else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
+          else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
+        }
+      } else drawStatus("Shelly-Fehler!", COL_BEZUG);
+    }
   }
 
   if (now - lastZen >= ZEN_MS) {
     lastZen = now;
-    if (WiFi.status() == WL_CONNECTED) { fetchZendure(); drawZendure(); }
+    if (WiFi.status() == WL_CONNECTED) { bool zk = fetchZendure(); updateHealth(znState, znOut, zk, ZEN_HOST); drawZendure(); }
   }
 
   if (now - lastSlow >= SLOW_MS) {

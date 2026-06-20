@@ -86,12 +86,15 @@ non-blocking BMS warning. Red counters/frame = critical event, yellow = harmless
 The board serves its own data over HTTP, so you can log and plot it from any device on
 the LAN — no serial cable required:
 
-- `http://<board-ip>/status` — live values + event counters + record cell spread (JSON)
+- `http://<board-ip>/status` — live values + event counters + record cell spread +
+  **device health** (`shelly_state`/`zendure_state`: 0 = ok, 1 = hung/API-down but
+  TCP-reachable, 2 = offline) (JSON)
 - `http://<board-ip>/balance` — ring buffer of the last 64 cell-balancing events
   (time, SoC, cell max/min, spread in mV)
 - `http://<board-ip>/daily` — ring buffer of the last 30 daily energy balances
   (epoch, saldo/import/export in kWh) **plus per-day event counts**
-  (bms/tief/netz/bal/warn), captured at each midnight reset
+  (bms/tief/netz/bal/warn) and per-day device-outage counts (shout/znout),
+  captured at each midnight reset
 
 Poll it from Home Assistant, Node-RED, a cron job, etc. A cell spread that grows over
 weeks is an early indicator of cell drift / aging.
