@@ -93,6 +93,9 @@ the LAN — no serial cable required:
 Poll it from Home Assistant, Node-RED, a cron job, etc. A cell spread that grows over
 weeks is an early indicator of cell drift / aging.
 
+**Tip:** give the board a fixed IP (DHCP reservation in your router) — like the Shelly
+and Zendure — so its API address stays stable for your poller.
+
 ## ⚠️ Disclaimer
 
 This is a **read-only monitor for display purposes**, *not* a certified safety device.
