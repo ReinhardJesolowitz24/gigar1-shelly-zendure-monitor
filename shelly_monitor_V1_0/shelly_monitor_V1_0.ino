@@ -101,6 +101,8 @@ unsigned int cntDump = 0, cntSoc = 0, cntFault = 0;          // Ereigniszaehler 
 bool warnActive = false, warnPrev = false;
 const char* warnText = "";
 unsigned int cntWarn = 0;
+bool balanceActive = false, balancePrev = false;
+unsigned int cntBalance = 0;
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -201,11 +203,12 @@ void drawStatus(const char* text, uint16_t color) {
 
 void drawCounters() {
   display.fillRect(0, 424, SCREEN_W, 16, COL_BG);
-  char buf[80];
-  snprintf(buf, sizeof(buf), "Alarme seit Start:   BMS %u   Tief %u   Netz %u   Warn %u", cntFault, cntSoc, cntDump, cntWarn);
+  char buf[96];
+  snprintf(buf, sizeof(buf), "Ereignisse:  BMS %u  Tief %u  Netz %u  Bal %u  Warn %u", cntFault, cntSoc, cntDump, cntBalance, cntWarn);
   uint16_t col = COL_UNIT;
-  if (cntFault || cntSoc || cntDump) col = COL_BEZUG;   // es gab einen Rot-Alarm
-  else if (cntWarn) col = COL_ZEN;                       // nur Warnungen
+  if (cntFault || cntSoc || cntDump) col = COL_BEZUG;   // Rot-Alarm gab es
+  else if (cntWarn)                  col = COL_ZEN;      // unbekannte Warnung (gelb)
+  else if (cntBalance)               col = COL_TITLE;    // nur harmloses Balancing (blau)
   printCentered(buf, 424, 2, col);
 }
 
@@ -231,15 +234,19 @@ void evalAlarm(unsigned long now) {
   bool overT  = (tempMax > TEMP_MAX_CRIT);
   bool bmsCrit = (zErr != 0) || overV || underV || overT;
 
-  // 4) GELB: faultLevel-Warnflag, aber kein harter/kritischer Fehler
-  bool warn = (zFault != 0) && !bmsCrit;
+  // 4) Nicht-kritische faultLevel-Flags differenzieren:
+  //    faultLevel == 2 = bekanntes Zell-Balancing am Ladeschluss (harmlos -> blau, "Bal")
+  //    sonstiges  != 0 = unbekanntes Flag -> gelbe Warnung ("Warn")
+  bool isBalance = (zFault == 2) && !bmsCrit;
+  bool isWarn    = (zFault != 0) && (zFault != 2) && !bmsCrit;
 
   // Ereignisse zaehlen: nur bei Flanke inaktiv -> aktiv
-  if (dumpAlarm && !dumpPrev)  cntDump++;
-  if (socAlarm  && !socPrev)   cntSoc++;
-  if (bmsCrit   && !faultPrev) cntFault++;
-  if (warn      && !warnPrev)  cntWarn++;
-  dumpPrev = dumpAlarm; socPrev = socAlarm; faultPrev = bmsCrit; warnPrev = warn;
+  if (dumpAlarm  && !dumpPrev)    cntDump++;
+  if (socAlarm   && !socPrev)     cntSoc++;
+  if (bmsCrit    && !faultPrev)   cntFault++;
+  if (isBalance  && !balancePrev) cntBalance++;
+  if (isWarn     && !warnPrev)    cntWarn++;
+  dumpPrev = dumpAlarm; socPrev = socAlarm; faultPrev = bmsCrit; balancePrev = isBalance; warnPrev = isWarn;
 
   // Rot-Alarm (Prioritaet): BMS-kritisch > Tiefentladung > Dumping
   if (bmsCrit) {
@@ -253,9 +260,10 @@ void evalAlarm(unsigned long now) {
   else if (dumpAlarm) { alarmActive = true; alarmText = "!! AKKU SPEIST INS NETZ - HEMS-FEHLER !!"; }
   else                { alarmActive = false; }
 
-  // Gelb-Warnung (Info, nicht blockierend)
-  warnActive = warn;
-  if (warn) { static char wbuf[40]; snprintf(wbuf, sizeof(wbuf), "BMS-Warnung (faultLevel=%d)", zFault); warnText = wbuf; }
+  // Nicht-blockierende Info-Zeilen
+  balanceActive = isBalance;
+  warnActive    = isWarn;
+  if (isWarn) { static char wbuf[40]; snprintf(wbuf, sizeof(wbuf), "BMS-Warnung (faultLevel=%d)", zFault); warnText = wbuf; }
 }
 
 void repaintAll() {
@@ -420,7 +428,8 @@ void loop() {
       evalAlarm(now);
       drawCounters();
       if (!alarmActive) {
-        if (warnActive) drawStatus(warnText, COL_ZEN);   // gelbe BMS-Warnung (nicht blockierend)
+        if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
+        else if (balanceActive) drawStatus("Zell-Balancing (faultLevel=2)", COL_TITLE); // blau: harmlos
         else { char st[40]; snprintf(st, sizeof(st), "Monitor  |  Laufzeit %lus", now / 1000); drawStatus(st, COL_UNIT); }
       }
     } else drawStatus("Shelly-Fehler!", COL_BEZUG);
