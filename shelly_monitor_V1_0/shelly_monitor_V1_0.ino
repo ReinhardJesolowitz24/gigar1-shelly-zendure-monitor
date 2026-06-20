@@ -93,6 +93,8 @@ const unsigned long BLINK_MS   = 600;
 const int           SOC_MIN_ALARM = 30;    // % Tiefentladungs-Warnschwelle (wie im Zendure)
 unsigned long anomSince = 0, lastBlink = 0;
 bool alarmActive = false, prevAlarm = false, blinkOn = false;
+const int DEBOUNCE_N = 3;          // Alarme erst nach N aufeinanderfolgenden Messungen (gegen Reboot-Transienten)
+int dbBms = 0, dbSoc = 0, dbBal = 0, dbWarn = 0;
 int  zFault = 0, zErr = 0;                  // BMS faultLevel / is_error
 const char* alarmText = "";
 bool dumpPrev = false, socPrev = false, faultPrev = false;   // Flankenerkennung
@@ -245,19 +247,30 @@ void evalAlarm(unsigned long now) {
   bool dumpAlarm = (anomSince != 0) && (now - anomSince >= ALARM_HOLD);
 
   // 2) Tiefentladung: SoC unter Schwelle
-  bool socAlarm = (zSoc >= 0) && (zSoc < SOC_MIN_ALARM);
+  bool socRaw  = (zSoc >= 0) && (zSoc < SOC_MIN_ALARM);
 
   // 3) BMS kritisch: harter Fehler ODER unabhaengig gepruefte Zell-/Temp-Grenzwerte
   bool overV  = (cellMax > CELL_MAX_CRIT);
   bool underV = (cellMin > 0 && cellMin < CELL_MIN_CRIT);
   bool overT  = (tempMax > TEMP_MAX_CRIT);
-  bool bmsCrit = (zErr != 0) || overV || underV || overT;
+  bool bmsRaw  = (zErr != 0) || overV || underV || overT;
 
   // 4) Nicht-kritische faultLevel-Flags differenzieren:
   //    faultLevel == 2 = bekanntes Zell-Balancing am Ladeschluss (harmlos -> blau, "Bal")
   //    sonstiges  != 0 = unbekanntes Flag -> gelbe Warnung ("Warn")
-  bool isBalance = (zFault == 2) && !bmsCrit;
-  bool isWarn    = (zFault != 0) && (zFault != 2) && !bmsCrit;
+  bool balRaw  = (zFault == 2) && !bmsRaw;
+  bool warnRaw = (zFault != 0) && (zFault != 2) && !bmsRaw;
+
+  // Entprellung: erst nach DEBOUNCE_N aufeinanderfolgenden Messungen gueltig
+  // (unterdrueckt Reboot-Transienten des Zendure, z.B. kurz SoC=0 / wirres faultLevel)
+  dbBms  = bmsRaw  ? dbBms  + 1 : 0;
+  dbSoc  = socRaw  ? dbSoc  + 1 : 0;
+  dbBal  = balRaw  ? dbBal  + 1 : 0;
+  dbWarn = warnRaw ? dbWarn + 1 : 0;
+  bool bmsCrit   = dbBms  >= DEBOUNCE_N;
+  bool socAlarm  = dbSoc  >= DEBOUNCE_N;
+  bool isBalance = dbBal  >= DEBOUNCE_N;
+  bool isWarn    = dbWarn >= DEBOUNCE_N;
 
   // Ereignisse zaehlen: nur bei Flanke inaktiv -> aktiv
   if (dumpAlarm  && !dumpPrev)    cntDump++;
