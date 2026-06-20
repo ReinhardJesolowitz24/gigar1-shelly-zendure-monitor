@@ -113,6 +113,14 @@ const int BAL_HIST = 64;
 BalEvent balHist[BAL_HIST];
 int balHead = 0;      // naechster Schreibindex im Ring
 int balStored = 0;    // belegte Eintraege (max BAL_HIST)
+
+// Tagessaldo-Historie (Ringpuffer der letzten 30 Tage)
+unsigned long sysEpoch = 0;   // Unixzeit vom Shelly (Datums-Stempel)
+struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; };
+const int DAY_HIST = 30;
+DayRec dayHist[DAY_HIST];
+int dayHead = 0, dayStored = 0;
+unsigned int dayCount = 0;
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -396,6 +404,7 @@ bool fetchSlow() {
     JsonDocument d; if (!deserializeJson(d, body)) {
       const char* tm = d["time"] | "";
       if (strlen(tm) >= 4) curTime = String(tm);
+      sysEpoch = d["unixtime"] | sysEpoch;
     }
   }
   if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, "/rpc/EMData.GetStatus?id=0", body)) return false;
@@ -408,7 +417,18 @@ bool fetchSlow() {
   // Mitternacht: Minute-im-Tag springt von ~23:xx (>1380) auf <01:00 (<60)
   int mod = parseMinuteOfDay(curTime);
   if (mod >= 0) {
-    if (prevMod > 1380 && mod < 60) { impBase = impWh; retBase = retWh; }
+    if (prevMod > 1380 && mod < 60) {
+      // Tag zu Ende: Tages-Saldo in den Ringpuffer sichern, DANN Basis zuruecksetzen
+      dayCount++;
+      dayHist[dayHead].id    = dayCount;
+      dayHist[dayHead].epoch = sysEpoch;
+      dayHist[dayHead].bezug = (impWh - impBase) / 1000.0;
+      dayHist[dayHead].einsp = (retWh - retBase) / 1000.0;
+      dayHist[dayHead].saldo = dayHist[dayHead].einsp - dayHist[dayHead].bezug;
+      dayHead = (dayHead + 1) % DAY_HIST;
+      if (dayStored < DAY_HIST) dayStored++;
+      impBase = impWh; retBase = retWh;
+    }
     prevMod = mod;
   }
 
@@ -460,6 +480,25 @@ void sendJsonBalance(WiFiClient& c) {
   c.print("]}");
 }
 
+void sendJsonDaily(WiFiClient& c) {
+  c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+  c.print("{\"count\":"); c.print(dayCount);
+  c.print(",\"stored\":"); c.print(dayStored);
+  c.print(",\"days\":[");
+  int start = (dayStored < DAY_HIST) ? 0 : dayHead;     // aeltester Tag zuerst
+  for (int i = 0; i < dayStored; i++) {
+    int idx = (start + i) % DAY_HIST;
+    if (i) c.print(",");
+    c.print("{\"id\":");          c.print(dayHist[idx].id);
+    c.print(",\"epoch\":");       c.print(dayHist[idx].epoch);
+    c.print(",\"saldo_kwh\":");   c.print(dayHist[idx].saldo, 3);
+    c.print(",\"bezug_kwh\":");   c.print(dayHist[idx].bezug, 3);
+    c.print(",\"einsp_kwh\":");   c.print(dayHist[idx].einsp, 3);
+    c.print("}");
+  }
+  c.print("]}");
+}
+
 void handleApi() {
   WiFiClient c = apiServer.available();
   if (!c) return;
@@ -469,10 +508,11 @@ void handleApi() {
   String req = c.readStringUntil('\n');                 // "GET /pfad HTTP/1.1"
   while (c.connected() && c.available()) { String l = c.readStringUntil('\n'); if (l.length() <= 1) break; }
   if      (req.indexOf("/balance") >= 0) sendJsonBalance(c);
+  else if (req.indexOf("/daily")   >= 0) sendJsonDaily(c);
   else if (req.indexOf("/status")  >= 0) sendJsonStatus(c);
   else {
     c.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
-    c.print("ShellyMonitor API:  /status   /balance");
+    c.print("ShellyMonitor API:  /status   /balance   /daily");
   }
   delay(2);
   c.stop();
