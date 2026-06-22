@@ -66,6 +66,10 @@ const unsigned long POLL_MS = 1000;    // Shelly Leistung/Phasen
 const unsigned long ZEN_MS  = 3000;    // Zendure (read-only)
 const unsigned long SLOW_MS = 15000;   // Zeit + Energiezaehler
 unsigned long lastPoll = 0, lastZen = 0, lastSlow = 0;
+// Adaptives Backoff: haengt/fehlt ein Geraet, wird es seltener abgefragt (entlastet Loop)
+// -> wichtig auf dem GIGA, dessen HW-Watchdog (~32 s) keine langen Loop-Blockaden vertraegt.
+unsigned long shInterval = POLL_MS, znInterval = ZEN_MS, slowInterval = SLOW_MS;
+const unsigned long BACKOFF_MAX = 30000;   // max. 30 s Abstand bei Offline/Hang
 const unsigned long BEAT_MS = 1000;    // Heartbeat-Blinken (zeigt: Sketch laeuft)
 unsigned long lastBeat = 0;
 bool beatOn = false;
@@ -342,9 +346,11 @@ void connectWiFi() {
       tBegin = millis();
     }
 
-    // Im Betrieb: nach 90 s erfolglosem Reconnect Board neu starten lassen
-    // (Watchdog NICHT mehr fuettern -> automatischer Reset, wie ein HW-Reset)
-    if (wdtActive && (millis() - t0 >= 90000)) {
+    // Im Betrieb: erst nach 5 min erfolglosem Reconnect Board neu starten lassen.
+    // (Grosszuegig, damit ein Router-Update / kurzer Netz-Ausfall von 2-3 min KEINEN
+    //  Neustart ausloest. Watchdog wird bis dahin weiter gefuettert; erst dann NICHT
+    //  mehr -> automatischer Reset wie ein HW-Reset.)
+    if (wdtActive && (millis() - t0 >= 300000)) {
       drawStatus("Reconnect fehlgeschlagen -> Neustart", COL_BEZUG);
       while (true) { }   // Watchdog loest den Reboot aus
     }
@@ -603,13 +609,14 @@ void loop() {
 
   if (now - lastBeat >= BEAT_MS) { lastBeat = now; beatOn = !beatOn; drawHeartbeat(beatOn); }
 
-  if (now - lastPoll >= POLL_MS) {
+  if (now - lastPoll >= shInterval) {
     lastPoll = now;
     if (WiFi.status() != WL_CONNECTED) { drawStatus("WLAN getrennt...", COL_BEZUG); connectWiFi(); }
     else {
       bool shOk = fetchShelly();
       updateHealth(shState, shOut, shOk, SHELLY_HOST);
       if (shOk) {
+        shInterval = POLL_MS;                       // wieder schnell abfragen
         drawTotal(gTotal); drawPhases();
         evalAlarm(now);
         drawCounters();
@@ -618,18 +625,31 @@ void loop() {
           else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
           else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
         }
-      } else drawStatus("Shelly-Fehler!", COL_BEZUG);
+      } else {
+        if (shInterval < BACKOFF_MAX) shInterval *= 2;   // Backoff: seltener abfragen
+        if (shInterval > BACKOFF_MAX) shInterval = BACKOFF_MAX;
+        drawStatus("Shelly-Fehler!", COL_BEZUG);
+      }
     }
   }
 
-  if (now - lastZen >= ZEN_MS) {
+  if (now - lastZen >= znInterval) {
     lastZen = now;
-    if (WiFi.status() == WL_CONNECTED) { bool zk = fetchZendure(); updateHealth(znState, znOut, zk, ZEN_HOST); drawZendure(); }
+    if (WiFi.status() == WL_CONNECTED) {
+      bool zk = fetchZendure();
+      updateHealth(znState, znOut, zk, ZEN_HOST);
+      if (zk) znInterval = ZEN_MS;                        // wieder normal
+      else { znInterval *= 2; if (znInterval > BACKOFF_MAX) znInterval = BACKOFF_MAX; }   // Backoff
+      drawZendure();
+    }
   }
 
-  if (now - lastSlow >= SLOW_MS) {
+  if (now - lastSlow >= slowInterval) {
     lastSlow = now;
-    if (WiFi.status() == WL_CONNECTED) { if (fetchSlow()) { drawTime(); drawSaldo(); } }
+    if (WiFi.status() == WL_CONNECTED) {
+      if (fetchSlow()) { slowInterval = SLOW_MS; drawTime(); drawSaldo(); }
+      else { slowInterval *= 2; if (slowInterval > 60000UL) slowInterval = 60000UL; }     // Backoff (max 60 s)
+    }
   }
 
   // Waechter-Anzeige: blinkender roter Rahmen + Banner bei Fehlbetrieb
