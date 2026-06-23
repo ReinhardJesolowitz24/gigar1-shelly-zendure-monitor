@@ -106,6 +106,8 @@ int dbBms = 0, dbSoc = 0, dbBal = 0, dbWarn = 0;
 
 // Geraete-Health: 0=ok, 1=haengt (TCP ok, API nein), 2=offline (kein TCP)
 int shState = 0, znState = 0;
+int shFailCount = 0;                 // aufeinanderfolgende Shelly-Fehlversuche (Entprellung)
+const int SH_FAIL_N = 3;             // "Shelly-Fehler" erst nach 3 Fehlern in Folge (transiente Blips ignorieren)
 unsigned int shOut = 0, znOut = 0;        // Ausfall-Episoden kumuliert (ok -> nicht-ok)
 unsigned int pshOut = 0, pznOut = 0;      // Snapshot der letzten Mitternacht
 int  zFault = 0, zErr = 0;                  // BMS faultLevel / is_error
@@ -626,8 +628,9 @@ void loop() {
 
       if (step == 0) {                         // Shelly Leistung/Phasen (Live)
         bool shOk = fetchShelly();
-        updateHealth(shState, shOut, shOk, SHELLY_HOST);
         if (shOk) {
+          shFailCount = 0;
+          updateHealth(shState, shOut, true, SHELLY_HOST);
           drawTotal(gTotal); drawPhases();
           evalAlarm(now);
           drawCounters();
@@ -636,7 +639,14 @@ void loop() {
             else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
             else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
           }
-        } else drawStatus("Shelly-Fehler!", COL_BEZUG);
+        } else {
+          shFailCount++;
+          if (shFailCount >= SH_FAIL_N) {       // erst nach N Fehlern in Folge als echter Ausfall werten
+            updateHealth(shState, shOut, false, SHELLY_HOST);
+            drawStatus("Shelly-Fehler!", COL_BEZUG);
+          }
+          // sonst: transienter Blip -> ignorieren, bisherige Anzeige bleibt stehen
+        }
       }
       else if (step == 1) {                    // Zendure (read-only)
         bool zk = fetchZendure();
