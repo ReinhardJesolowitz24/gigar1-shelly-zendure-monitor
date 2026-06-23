@@ -65,11 +65,15 @@ const int   ZEN_PORT = 80;
 const unsigned long POLL_MS = 1000;    // Shelly Leistung/Phasen
 const unsigned long ZEN_MS  = 3000;    // Zendure (read-only)
 const unsigned long SLOW_MS = 15000;   // Zeit + Energiezaehler
-unsigned long lastPoll = 0, lastZen = 0, lastSlow = 0;
-// Adaptives Backoff: haengt/fehlt ein Geraet, wird es seltener abgefragt (entlastet Loop)
-// -> wichtig auf dem GIGA, dessen HW-Watchdog (~32 s) keine langen Loop-Blockaden vertraegt.
-unsigned long shInterval = POLL_MS, znInterval = ZEN_MS, slowInterval = SLOW_MS;
-const unsigned long BACKOFF_MAX = 30000;   // max. 30 s Abstand bei Offline/Hang
+// Getaktete Abfrage-Sequenz: immer nur EINE Verbindung gleichzeitig, mit Pausen
+// -> minimaler TCP-Churn, kein Ueberlappen. Schritt 0=Shelly EM, 1=Zendure, 2=Slow (Zeit+Energie).
+// (Identisch zur ESP32-Variante, damit beide Repos moeglichst gleich bleiben.)
+const uint8_t  POLL_SEQ[] = {0, 1, 0, 1, 2};   // 2x (EM, Zendure), dann 1x Slow(Sys+EMData) -> 5 Schritte/Zyklus
+const int      SEQ_LEN    = sizeof(POLL_SEQ);
+const unsigned long STEP_MS = 3000;            // 3 s Pause zwischen den Anfragen
+int            seqIdx   = 0;
+unsigned long  lastStep = 0;
+char           httpBuf[4096];                  // fester HTTP-Antwort-Puffer (statt String -> kein Heap-Churn)
 const unsigned long BEAT_MS = 1000;    // Heartbeat-Blinken (zeigt: Sketch laeuft)
 unsigned long lastBeat = 0;
 bool beatOn = false;
@@ -359,23 +363,27 @@ void connectWiFi() {
   drawStatus(("WLAN verbunden  " + myIp).c_str(), COL_EINSPEIS);
 }
 
-bool httpGetBody(const char* host, int port, const char* path, String& body) {
+// Liest den HTTP-Body in einen FESTEN char-Puffer (kein String -> kein Heap-Churn).
+bool httpGetBody(const char* host, int port, const char* path, char* out, size_t outSize) {
   WiFiClient client; client.setTimeout(5000);
   if (!client.connect(host, port)) return false;
-  client.print(String("GET ") + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+  char req[160];
+  snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+  client.print(req);
   unsigned long t = millis();
   while (!client.available() && millis() - t < 5000) delay(10);
   if (!client.available()) { client.stop(); return false; }
-  String s = client.readStringUntil('\n');
+  String s = client.readStringUntil('\n');                       // Statuszeile (1x pro Fetch)
   if (s.indexOf("200") == -1) { client.stop(); return false; }
   while (client.connected()) { String l = client.readStringUntil('\n'); l.trim(); if (l.length() == 0) break; }
-  body = ""; unsigned long t2 = millis();
+  size_t n = 0; unsigned long t2 = millis();
   while (client.connected() || client.available()) {
-    if (client.available()) body += (char)client.read();
+    if (client.available()) { char ch = (char)client.read(); if (n < outSize - 1) out[n++] = ch; }  // Puffer voll -> Rest verwerfen
     else if (millis() - t2 > 3000) break;
   }
+  out[n] = 0;
   client.stop();
-  return body.length() > 0;
+  return n > 0;
 }
 
 int parseMinuteOfDay(const String& t) {
@@ -387,8 +395,8 @@ int parseMinuteOfDay(const String& t) {
 }
 
 bool fetchShelly() {
-  String body; if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, SHELLY_PATH, body)) return false;
-  JsonDocument doc; if (deserializeJson(doc, body)) return false;
+  if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, SHELLY_PATH, httpBuf, sizeof(httpBuf))) return false;
+  JsonDocument doc; if (deserializeJson(doc, httpBuf)) return false;
   gTotal = doc["total_act_power"].as<float>() * -1.0f;   // <0=Bezug, >0=Einspeisung
   pA = doc["a_act_power"].as<float>() * -1.0f;
   pB = doc["b_act_power"].as<float>() * -1.0f;
@@ -399,8 +407,8 @@ bool fetchShelly() {
 }
 
 bool fetchZendure() {
-  String body; if (!httpGetBody(ZEN_HOST, ZEN_PORT, "/properties/report", body)) return false;
-  JsonDocument doc; if (deserializeJson(doc, body)) return false;
+  if (!httpGetBody(ZEN_HOST, ZEN_PORT, "/properties/report", httpBuf, sizeof(httpBuf))) return false;
+  JsonDocument doc; if (deserializeJson(doc, httpBuf)) return false;
   JsonObject pr = doc["properties"]; if (pr.isNull()) return false;
   zSoc   = pr["electricLevel"] | -1;
   zOut   = pr["outputHomePower"] | 0;
@@ -426,16 +434,15 @@ bool fetchZendure() {
 
 // Zeit (Sys.GetStatus) + Energiezaehler (EMData.GetStatus), Tagessaldo
 bool fetchSlow() {
-  String body;
-  if (httpGetBody(SHELLY_HOST, SHELLY_PORT, "/rpc/Sys.GetStatus", body)) {
-    JsonDocument d; if (!deserializeJson(d, body)) {
+  if (httpGetBody(SHELLY_HOST, SHELLY_PORT, "/rpc/Sys.GetStatus", httpBuf, sizeof(httpBuf))) {
+    JsonDocument d; if (!deserializeJson(d, httpBuf)) {
       const char* tm = d["time"] | "";
       if (strlen(tm) >= 4) curTime = String(tm);
       sysEpoch = d["unixtime"] | sysEpoch;
     }
   }
-  if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, "/rpc/EMData.GetStatus?id=0", body)) return false;
-  JsonDocument d2; if (deserializeJson(d2, body)) return false;
+  if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, "/rpc/EMData.GetStatus?id=0", httpBuf, sizeof(httpBuf))) return false;
+  JsonDocument d2; if (deserializeJson(d2, httpBuf)) return false;
   impWh = d2["total_act"]     | impWh;   // Bezug gesamt (Wh)
   retWh = d2["total_act_ret"] | retWh;   // Einspeisung gesamt (Wh)
 
@@ -609,46 +616,36 @@ void loop() {
 
   if (now - lastBeat >= BEAT_MS) { lastBeat = now; beatOn = !beatOn; drawHeartbeat(beatOn); }
 
-  if (now - lastPoll >= shInterval) {
-    lastPoll = now;
+  // Getaktete Abfrage: pro STEP_MS genau EINE Anfrage (nie ueberlappend -> wenig TCP-Churn)
+  if (now - lastStep >= STEP_MS) {
+    lastStep = now;
     if (WiFi.status() != WL_CONNECTED) { drawStatus("WLAN getrennt...", COL_BEZUG); connectWiFi(); }
     else {
-      bool shOk = fetchShelly();
-      updateHealth(shState, shOut, shOk, SHELLY_HOST);
-      if (shOk) {
-        shInterval = POLL_MS;                       // wieder schnell abfragen
-        drawTotal(gTotal); drawPhases();
-        evalAlarm(now);
-        drawCounters();
-        if (!alarmActive) {
-          if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
-          else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
-          else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
-        }
-      } else {
-        if (shInterval < BACKOFF_MAX) shInterval *= 2;   // Backoff: seltener abfragen
-        if (shInterval > BACKOFF_MAX) shInterval = BACKOFF_MAX;
-        drawStatus("Shelly-Fehler!", COL_BEZUG);
+      uint8_t step = POLL_SEQ[seqIdx];
+      seqIdx = (seqIdx + 1) % SEQ_LEN;
+
+      if (step == 0) {                         // Shelly Leistung/Phasen (Live)
+        bool shOk = fetchShelly();
+        updateHealth(shState, shOut, shOk, SHELLY_HOST);
+        if (shOk) {
+          drawTotal(gTotal); drawPhases();
+          evalAlarm(now);
+          drawCounters();
+          if (!alarmActive) {
+            if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
+            else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
+            else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
+          }
+        } else drawStatus("Shelly-Fehler!", COL_BEZUG);
       }
-    }
-  }
-
-  if (now - lastZen >= znInterval) {
-    lastZen = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      bool zk = fetchZendure();
-      updateHealth(znState, znOut, zk, ZEN_HOST);
-      if (zk) znInterval = ZEN_MS;                        // wieder normal
-      else { znInterval *= 2; if (znInterval > BACKOFF_MAX) znInterval = BACKOFF_MAX; }   // Backoff
-      drawZendure();
-    }
-  }
-
-  if (now - lastSlow >= slowInterval) {
-    lastSlow = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      if (fetchSlow()) { slowInterval = SLOW_MS; drawTime(); drawSaldo(); }
-      else { slowInterval *= 2; if (slowInterval > 60000UL) slowInterval = 60000UL; }     // Backoff (max 60 s)
+      else if (step == 1) {                    // Zendure (read-only)
+        bool zk = fetchZendure();
+        updateHealth(znState, znOut, zk, ZEN_HOST);
+        drawZendure();
+      }
+      else {                                   // Slow: Zeit + Energie/Tagessaldo (kWh kommt vom Shelly)
+        if (fetchSlow()) { drawTime(); drawSaldo(); }
+      }
     }
   }
 
