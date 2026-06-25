@@ -10,6 +10,8 @@ Built as a diverse, independent cross-check after a Zendure firmware update made
 battery ignore its configured limits (e.g. discharging into the grid). A simple, cheap
 board supervising a more complex one — the *checker* is independent of the *doer*.
 
+💡 **Budget sibling:** [esp32-shelly-zendure-monitor](https://github.com/ReinhardJesolowitz24/esp32-shelly-zendure-monitor) — the same monitor on an ESP32-S3 + ELECROW 7″ display at ~1/3 the cost.
+
 > **Read-only:** the sketch never writes to the Zendure, so it does not disturb the
 > device's own cloud/HEMS control.
 

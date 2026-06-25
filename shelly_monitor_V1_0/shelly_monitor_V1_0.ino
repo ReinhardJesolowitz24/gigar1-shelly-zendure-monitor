@@ -33,11 +33,13 @@
 #include <ArduinoJson.h>
 #include "Arduino_GigaDisplay_GFX.h"
 #include "mbed.h"             // Hardware-Watchdog (STM32H7 IWDG)
+#include <malloc.h>           // mallinfo() -> Heap-Diagnose (Leck/Fragmentierung sichtbar)
 #include "arduino_secrets.h"  // WLAN + Geraete-IPs (NICHT eingecheckt)
 
 GigaDisplay_GFX display;
 
 #define ROTATION   1
+#define FW_VERSION "giga-1.0"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -74,10 +76,23 @@ const unsigned long STEP_MS = 3000;            // 3 s Pause zwischen den Anfrage
 int            seqIdx   = 0;
 unsigned long  lastStep = 0;
 char           httpBuf[4096];                  // fester HTTP-Antwort-Puffer (statt String -> kein Heap-Churn)
+// Zendure haengt oefter (V2.0.0): nach Fehlversuch 5 min Pause -> entlastet WLAN-Stack (weniger Churn gegen toten Endpunkt)
+// (Identisch zur ESP32-Variante, damit beide Repos moeglichst gleich bleiben.)
+unsigned long znPauseUntil = 0;
+const unsigned long ZEN_PAUSE_MS = 300000UL;   // 5 min
 const unsigned long BEAT_MS = 1000;    // Heartbeat-Blinken (zeigt: Sketch laeuft)
 unsigned long lastBeat = 0;
 bool beatOn = false;
 bool wdtActive = false;   // Watchdog erst nach WLAN-Erstverbindung aktiv
+// --- Software-Fenster-Watchdog (effektiv ~9 min ueber den 32,76s-HW-Watchdog) ---
+// Ein Ticker fuettert den HW-Watchdog NUR, solange der Haupt-Loop in den letzten
+// WD_WINDOW_MS Fortschritt machte. Stuck >9min -> Ticker stoppt -> HW-Watchdog (~32s)
+// resettet. So werden Router-Neustart/Ein-Aus/SW-Update (Minuten) abgefangen; nur
+// echte lange Haenger -> Reboot. NUR fuer PASSIVEN Monitor ok, NICHT fuer einen Regler!
+const unsigned long WD_WINDOW_MS = 540000;   // 9 min Toleranzfenster
+volatile uint32_t   g_lastLoopMs = 0;        // Zeitstempel des letzten Loop-Fortschritts
+mbed::Ticker        wdTicker;
+void wdFeed() { if ((uint32_t)(millis() - g_lastLoopMs) < WD_WINDOW_MS) mbed::Watchdog::get_instance().kick(); }
 
 // ── Messwerte ────────────────────────────────────────────────────────────────
 float gTotal = 0;
@@ -166,6 +181,25 @@ void printCentered(const char* text, int y, uint8_t sz, uint16_t color) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// ── Dirty-Cache: nur neu zeichnen, wenn sich der Wert geaendert hat ───────────
+// (weniger Framebuffer-Schreibzugriffe -> ruhigeres Bild, weniger Last; identisch zur ESP32-Variante)
+long dcTotal = -999999L;
+long dcP[3] = {-999999L,-999999L,-999999L}, dcU[3] = {-999999L,-999999L,-999999L}, dcI[3] = {-999999L,-999999L,-999999L};
+int  dcSoc = -999, dcZOut = -999, dcZAc = -999, dcZnState = -999;
+long dcSaldo = -999999L, dcBezug = -999999L, dcEinsp = -999999L;
+char dcTime[8] = "";
+long dcCntF=-1, dcCntS=-1, dcCntD=-1, dcCntB=-1, dcCntW=-1;
+char dcStatus[64] = ""; uint16_t dcStatusCol = 0xFFFF;
+void invalidateDirtyCache() {   // erzwingt Neuzeichnen aller dynamischen Felder (nach Vollbild-Repaint)
+  dcTotal = -999999L;
+  for (int k=0;k<3;k++){ dcP[k]=dcU[k]=dcI[k]=-999999L; }
+  dcSoc=dcZOut=dcZAc=dcZnState=-999;
+  dcSaldo=dcBezug=dcEinsp=-999999L;
+  dcTime[0]=0;
+  dcCntF=dcCntS=dcCntD=dcCntB=dcCntW=-1;
+  dcStatus[0]=0;
+}
+
 void drawStaticLayout() {
   display.fillScreen(COL_BG);
   printAt(20, 8, "Shelly Pro 3EM - Monitor", 3, COL_TITLE);
@@ -188,6 +222,8 @@ void drawStaticLayout() {
 }
 
 void drawTime() {
+  if (strcmp(curTime.c_str(), dcTime) == 0) return;     // unveraendert -> nicht neu zeichnen
+  strncpy(dcTime, curTime.c_str(), sizeof(dcTime) - 1); dcTime[sizeof(dcTime) - 1] = 0;
   display.fillRect(630, 6, SCREEN_W - 630, 34, COL_BG);
   printAt(660, 12, curTime.c_str(), 3, COL_VAL);
 }
@@ -197,6 +233,9 @@ void drawHeartbeat(bool on) {
 }
 
 void drawTotal(float p) {
+  long v = lroundf(p);
+  if (v == dcTotal) return;                              // gleicher gerundeter Wert -> nicht neu zeichnen
+  dcTotal = v;
   display.fillRect(0, 78, SCREEN_W, 68, COL_BG);
   char buf[20]; snprintf(buf, sizeof(buf), "%.0f", p);
   printCentered(buf, 82, 7, (p < 0) ? COL_BEZUG : COL_EINSPEIS);
@@ -209,6 +248,13 @@ void drawCell(int x, int y, float val, const char* fmt, bool colorBySign) {
 }
 
 void drawPhases() {
+  long p[3] = {lroundf(pA), lroundf(pB), lroundf(pC)};
+  long u[3] = {lroundf(uA*10), lroundf(uB*10), lroundf(uC*10)};   // 0,1-V-Aufloesung
+  long c[3] = {lroundf(iA*10), lroundf(iB*10), lroundf(iC*10)};   // 0,1-A-Aufloesung
+  bool same = true;
+  for (int k=0;k<3;k++) if (p[k]!=dcP[k] || u[k]!=dcU[k] || c[k]!=dcI[k]) same = false;
+  if (same) return;                                     // nichts geaendert -> nicht neu zeichnen
+  for (int k=0;k<3;k++){ dcP[k]=p[k]; dcU[k]=u[k]; dcI[k]=c[k]; }
   display.fillRect(CX_L1 - 5, 185, SCREEN_W - CX_L1, 95, COL_BG);
   drawCell(CX_L1, 192, pA, "%.0f", true);  drawCell(CX_L2, 192, pB, "%.0f", true);  drawCell(CX_L3, 192, pC, "%.0f", true);
   drawCell(CX_L1, 224, uA, "%.1f", false); drawCell(CX_L2, 224, uB, "%.1f", false); drawCell(CX_L3, 224, uC, "%.1f", false);
@@ -216,6 +262,8 @@ void drawPhases() {
 }
 
 void drawZendure() {
+  if (zSoc==dcSoc && zOut==dcZOut && zAc==dcZAc && znState==dcZnState) return;   // unveraendert
+  dcSoc=zSoc; dcZOut=zOut; dcZAc=zAc; dcZnState=znState;
   display.fillRect(0, 300, SCREEN_W, 20, COL_BG);
   char buf[70];
   if      (znState == 2) snprintf(buf, sizeof(buf), "Zendure: OFFLINE (kein TCP)");
@@ -226,6 +274,9 @@ void drawZendure() {
 }
 
 void drawSaldo() {
+  long s=lroundf(saldoKwh*1000), b=lroundf(bezugKwh*1000), e=lroundf(einspKwh*1000);
+  if (s==dcSaldo && b==dcBezug && e==dcEinsp) return;   // unveraendert (mWh-Aufloesung)
+  dcSaldo=s; dcBezug=b; dcEinsp=e;
   display.fillRect(0, 358, SCREEN_W, 38, COL_BG);
   char buf[24]; snprintf(buf, sizeof(buf), "%+.3f kWh", saldoKwh);
   printCentered(buf, 360, 4, (saldoKwh < 0) ? COL_BEZUG : COL_EINSPEIS);
@@ -235,11 +286,15 @@ void drawSaldo() {
 }
 
 void drawStatus(const char* text, uint16_t color) {
+  if (strcmp(text, dcStatus) == 0 && color == dcStatusCol) return;   // unveraendert
+  strncpy(dcStatus, text, sizeof(dcStatus) - 1); dcStatus[sizeof(dcStatus) - 1] = 0; dcStatusCol = color;
   display.fillRect(0, 448, SCREEN_W, 30, COL_BG);
   printCentered(text, 452, 2, color);
 }
 
 void drawCounters() {
+  if ((long)cntFault==dcCntF && (long)cntSoc==dcCntS && (long)cntDump==dcCntD && (long)cntBalance==dcCntB && (long)cntWarn==dcCntW) return;  // unveraendert
+  dcCntF=cntFault; dcCntS=cntSoc; dcCntD=cntDump; dcCntB=cntBalance; dcCntW=cntWarn;
   display.fillRect(0, 424, SCREEN_W, 16, COL_BG);
   char buf[96];
   snprintf(buf, sizeof(buf), "Ereignisse:  BMS %u  Tief %u  Netz %u  Bal %u  Warn %u", cntFault, cntSoc, cntDump, cntBalance, cntWarn);
@@ -332,6 +387,7 @@ void evalAlarm(unsigned long now) {
 }
 
 void repaintAll() {
+  invalidateDirtyCache();   // nach Vollbild-Loeschung muessen alle dynamischen Felder neu gezeichnet werden
   drawStaticLayout(); drawTime(); drawTotal(gTotal); drawPhases(); drawZendure(); drawSaldo(); drawCounters();
 }
 
@@ -343,7 +399,6 @@ void connectWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    if (wdtActive) mbed::Watchdog::get_instance().kick();
 
     // Alle 12 s frischer Versuch (Modul aus haengendem Zustand holen)
     if (millis() - tBegin >= 12000) {
@@ -352,12 +407,13 @@ void connectWiFi() {
       tBegin = millis();
     }
 
-    // Im Betrieb: erst nach 5 min erfolglosem Reconnect Board neu starten lassen.
-    // (Grosszuegig, damit ein Router-Update / kurzer Netz-Ausfall von 2-3 min KEINEN
-    //  Neustart ausloest. Watchdog wird bis dahin weiter gefuettert; erst dann NICHT
-    //  mehr -> automatischer Reset wie ein HW-Reset.)
-    if (wdtActive && (millis() - t0 >= 300000)) {
+    // Im Betrieb: erst nach 10 min erfolglosem Reconnect Board neu starten lassen.
+    // (Grosszuegig, damit ein Router-SW-Update / Netz-Ausfall von mehreren min KEINEN
+    //  Neustart ausloest - ein Ein/Aus dauert je nach Router schon 3-4 min. Watchdog
+    //  wird bis dahin weiter gefuettert; erst dann NICHT mehr -> Reset wie HW-Reset.)
+    if (wdtActive && (millis() - t0 >= 600000)) {
       drawStatus("Reconnect fehlgeschlagen -> Neustart", COL_BEZUG);
+      Serial.println("RECONNECT FEHLGESCHLAGEN -> NEUSTART (Watchdog)");   // im Serial-Log sichtbar
       while (true) { }   // Watchdog loest den Reboot aus
     }
   }
@@ -367,8 +423,11 @@ void connectWiFi() {
 
 // Liest den HTTP-Body in einen FESTEN char-Puffer (kein String -> kein Heap-Churn).
 bool httpGetBody(const char* host, int port, const char* path, char* out, size_t outSize) {
+  if (WiFi.status() != WL_CONNECTED) return false;          // kein Connect auf totem Link (verhindert blockierenden Connect)
   WiFiClient client; client.setTimeout(5000);
-  if (!client.connect(host, port)) return false;
+  IPAddress ipAddr; bool gotIp = ipAddr.fromString(host);   // numerische IP direkt -> KEIN DNS/gethostbyname-Hang
+  bool conOk = gotIp ? client.connect(ipAddr, port) : client.connect(host, port);
+  if (!conOk) return false;
   char req[160];
   snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
   client.print(req);
@@ -498,7 +557,7 @@ void updateHealth(int& state, unsigned int& outCnt, bool apiOk, const char* host
 
 void sendJsonStatus(WiFiClient& c) {
   c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
-  c.print("{\"uptime_s\":");      c.print(millis() / 1000);
+  c.print("{\"fw\":\"" FW_VERSION "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"uptime_s\":");      c.print(millis() / 1000);
   c.print(",\"time\":\"");        c.print(curTime); c.print("\"");
   c.print(",\"netz_w\":");        c.print(gTotal, 0);
   c.print(",\"saldo_kwh\":");     c.print(saldoKwh, 3);
@@ -518,6 +577,9 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"zendure_state\":"); c.print(znState);
   c.print(",\"shelly_out\":");    c.print(shOut);
   c.print(",\"zendure_out\":");   c.print(znOut);
+  struct mallinfo mi = mallinfo();
+  c.print(",\"heap_used\":");     c.print(mi.uordblks);   // belegt (Bytes) -> steigt bei Leck
+  c.print(",\"heap_free\":");     c.print(mi.fordblks);   // frei im Arena (Bytes) -> faellt bei Fragmentierung/Druck
   c.print("}");
 }
 
@@ -606,13 +668,16 @@ void setup() {
   uint32_t maxMs = mbed::Watchdog::get_instance().get_max_timeout();
   if (toMs > maxMs) toMs = maxMs;
   mbed::Watchdog::get_instance().start(toMs);
+  g_lastLoopMs = millis();              // Fenster-Watchdog: Startzeitpunkt
+  wdTicker.attach(wdFeed, 8.0f);        // alle 8 s fuettern, solange Loop-Fortschritt < WD_WINDOW_MS
   wdtActive = true;
-  Serial.print("Watchdog aktiv, Timeout (ms): "); Serial.println(toMs);
+  Serial.print("Watchdog aktiv, HW-Timeout (ms): "); Serial.print(toMs);
+  Serial.print("  | SW-Fenster (ms): "); Serial.println(WD_WINDOW_MS);
   Serial.println("CSV,BAL,time,soc,cellMax,cellMin,spread_mV");   // Kopfzeile fuers Balancing-Log
 }
 
 void loop() {
-  mbed::Watchdog::get_instance().kick();   // Watchdog fuettern (jeden Durchlauf)
+  g_lastLoopMs = millis();   // Fenster-Watchdog: Loop-Fortschritt melden (Ticker fuettert daraufhin den HW-Watchdog)
   handleApi();                             // JSON-API bedienen (nicht-blockierend)
   unsigned long now = millis();
 
@@ -637,7 +702,7 @@ void loop() {
           if (!alarmActive) {
             if (warnActive)         drawStatus(warnText, COL_ZEN);                           // gelb: unbekanntes Flag
             else if (balanceActive) { int sp=(cellMax-cellMin)*10; char bs[56]; snprintf(bs,sizeof(bs),"Zell-Balancing  Spreizung %d mV (Rekord %d)", sp, balSpreadMax); drawStatus(bs, COL_TITLE); } // blau: harmlos
-            else { char st[56]; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lus", myIp.c_str(), now / 1000); drawStatus(st, COL_UNIT); }
+            else { char st[64]; unsigned long up=now/1000; snprintf(st, sizeof(st), "IP %s   |   Laufzeit %lud %luh %lum", myIp.c_str(), up/86400, (up%86400)/3600, (up%3600)/60); drawStatus(st, COL_UNIT); }
           }
         } else {
           shFailCount++;
@@ -649,9 +714,14 @@ void loop() {
         }
       }
       else if (step == 1) {                    // Zendure (read-only)
-        bool zk = fetchZendure();
-        updateHealth(znState, znOut, zk, ZEN_HOST);
-        drawZendure();
+        if (millis() >= znPauseUntil) {        // nur abfragen, wenn keine Zendure-Pause laeuft
+          bool zk = fetchZendure();
+          updateHealth(znState, znOut, zk, ZEN_HOST);
+          if (!zk) znPauseUntil = millis() + ZEN_PAUSE_MS;   // haengt/offline -> 5 min Pause
+          else     znPauseUntil = 0;                          // antwortet wieder -> normal
+          drawZendure();
+        }
+        // sonst: Zendure-Pause aktiv -> nicht abfragen (entlastet Loop/WLAN-Stack), Anzeige bleibt
       }
       else {                                   // Slow: Zeit + Energie/Tagessaldo (kWh kommt vom Shelly)
         if (fetchSlow()) { drawTime(); drawSaldo(); }
