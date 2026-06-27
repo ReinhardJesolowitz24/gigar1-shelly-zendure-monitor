@@ -38,6 +38,26 @@ non-blocking BMS warning. Red counters/frame = critical event, yellow = harmless
   auto-recovers from a freeze
 - **JSON API over WiFi** — query live values and the cell-balancing history from any
   device on the LAN (`/status`, `/balance`), no serial cable needed
+- **Daily balance survives reboots & power loss** (KVStore) — see [Persistence & resilience](#persistence--resilience-v110)
+
+## Persistence & resilience (v1.1.0)
+
+The daily energy balance is kept in the GIGA's **KVStore** (the mbed non-volatile
+key-value store): after any reboot — including a real power cut — the board restores the
+day's baseline if the stored entry is from the *same local day*, so the saldo **continues**
+instead of resetting to zero. A fresh baseline is written only ~once per day (midnight
+rollover / first start of a new day), so flash wear is negligible. Validated on hardware
+across a **12-minute WiFi outage** — the windowed watchdog rides it through *without* a
+reboot — and a **cold power-cycle**.
+
+The `/status` API gained matching diagnostics:
+
+| Field | Meaning |
+|---|---|
+| `base_restored` | `true` if the day's saldo was restored from KVStore after a reboot |
+| `boots` | persistent boot counter — reveals unobserved reboots |
+| `heap_used_max` | peak heap usage since boot (leak indicator) |
+| `rssi` | current WiFi signal strength (dBm) |
 
 ## Hardware
 

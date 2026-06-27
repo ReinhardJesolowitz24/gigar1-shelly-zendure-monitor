@@ -33,13 +33,15 @@
 #include <ArduinoJson.h>
 #include "Arduino_GigaDisplay_GFX.h"
 #include "mbed.h"             // Hardware-Watchdog (STM32H7 IWDG)
+#include "kvstore_global_api.h" // mbed KVStore: Tagessaldo-Baseline ueber Reboot/Stromaus retten
+#include "ResetReason.h"        // mbed: Reset-Ursache (WATCHDOG/POWER_ON/...) -> /status reset_reason
 #include <malloc.h>           // mallinfo() -> Heap-Diagnose (Leck/Fragmentierung sichtbar)
 #include "arduino_secrets.h"  // WLAN + Geraete-IPs (NICHT eingecheckt)
 
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.0"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.1"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -455,6 +457,55 @@ int parseMinuteOfDay(const String& t) {
   return h * 60 + m;
 }
 
+// ── Tagessaldo-Persistenz (mbed KVStore): Baseline ueber Reboot/Stromaus retten ──
+// Speichert {lokale Tagesnummer, impBase, retBase}. Nach einem Reset wird, sobald die
+// Zeit da ist, geprueft: gleicher Tag -> Baseline wiederherstellen (Saldo laeuft weiter),
+// sonst frische Baseline. Schreibzugriff nur ~1x/Tag (Rollover/erste Baseline).
+struct SaldoNVM { long day; double imp; double ret; };
+bool baseRestored = false;        // Baseline aus NVM wiederhergestellt (true) oder frisch (false)?
+unsigned long g_bootCount = 0;    // persistierter Boot-Zaehler (erkennt unbeobachtete Reboots)
+long g_heapUsedMax = 0;           // hoechster heap_used (uordblks) seit Boot -> Leck-Indikator
+const char* gigaResetReason = "?";   // beim Boot aus mbed::ResetReason gesetzt
+const char* gigaResetStr(reset_reason_t r) {
+  switch (r) {
+    case RESET_REASON_POWER_ON:       return "POWERON";
+    case RESET_REASON_PIN_RESET:      return "PIN";
+    case RESET_REASON_BROWN_OUT:      return "BROWNOUT";
+    case RESET_REASON_SOFTWARE:       return "SOFTWARE";
+    case RESET_REASON_WATCHDOG:       return "WATCHDOG";
+    case RESET_REASON_LOCKUP:         return "LOCKUP";
+    case RESET_REASON_WAKE_LOW_POWER: return "WAKE_LP";
+    case RESET_REASON_MULTIPLE:       return "MULTIPLE";
+    default:                          return "UNKNOWN";
+  }
+}
+long localDayNumber() {            // lokale Kalendertag-Nummer aus UTC-Epoch + lokaler Uhrzeit
+  if (sysEpoch == 0) return -1;
+  int locMin = parseMinuteOfDay(curTime);
+  if (locMin < 0) return -1;
+  long utcMin = (long)((sysEpoch % 86400UL) / 60);
+  long off = locMin - utcMin;      // Zeitzonen-Offset (Minuten)
+  if (off >  720) off -= 1440;     // Tagesgrenzen-Wrap (max +-12h)
+  if (off < -720) off += 1440;
+  return ((long)sysEpoch + off * 60) / 86400;
+}
+void saveBaseline() {              // aktuelle Baseline + heutige Tagesnummer ins NVM
+  long d = localDayNumber();
+  if (d < 0) return;               // ohne gueltige Zeit nicht speichern
+  SaldoNVM s = { d, impBase, retBase };
+  kv_set("saldo", &s, sizeof(s), 0);
+}
+bool tryRestoreBaseline() {        // Baseline aus NVM holen, falls vom selben Tag
+  long today = localDayNumber();
+  if (today < 0) return false;
+  SaldoNVM s; size_t actual = 0;
+  int rc = kv_get("saldo", &s, sizeof(s), &actual);
+  if (rc == 0 && actual == sizeof(s) && s.day == today && s.imp >= 0 && s.ret >= 0) {
+    impBase = s.imp; retBase = s.ret; return true;
+  }
+  return false;
+}
+
 bool fetchShelly() {
   if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, SHELLY_PATH, httpBuf, sizeof(httpBuf))) return false;
   JsonDocument doc; if (deserializeJson(doc, httpBuf)) return false;
@@ -507,7 +558,20 @@ bool fetchSlow() {
   impWh = d2["total_act"]     | impWh;   // Bezug gesamt (Wh)
   retWh = d2["total_act_ret"] | retWh;   // Einspeisung gesamt (Wh)
 
-  if (!baseSet) { impBase = impWh; retBase = retWh; baseSet = true; }
+  if (!baseSet) {
+    if (localDayNumber() >= 0) {                 // erst mit gueltiger Zeit endgueltig setzen
+      if (tryRestoreBaseline()) {                // Heute-Eintrag im NVM -> Saldo laeuft weiter
+        baseRestored = true;
+      } else {                                   // kein Eintrag -> frische Baseline
+        impBase = impWh; retBase = retWh;
+        saveBaseline();
+        baseRestored = false;
+      }
+      baseSet = true;                            // ab jetzt fix (wiederhergestellt ODER frisch)
+    } else {
+      impBase = impWh; retBase = retWh;          // Zeit noch nicht da -> provisorisch (Anzeige ~0)
+    }
+  }
 
   // Mitternacht: Minute-im-Tag springt von ~23:xx (>1380) auf <01:00 (<60)
   int mod = parseMinuteOfDay(curTime);
@@ -532,6 +596,7 @@ bool fetchSlow() {
       dayHead = (dayHead + 1) % DAY_HIST;
       if (dayStored < DAY_HIST) dayStored++;
       impBase = impWh; retBase = retWh;
+      saveBaseline();                            // neuen Tag ins NVM persistieren
     }
     prevMod = mod;
   }
@@ -580,6 +645,12 @@ void sendJsonStatus(WiFiClient& c) {
   struct mallinfo mi = mallinfo();
   c.print(",\"heap_used\":");     c.print(mi.uordblks);   // belegt (Bytes) -> steigt bei Leck
   c.print(",\"heap_free\":");     c.print(mi.fordblks);   // frei im Arena (Bytes) -> faellt bei Fragmentierung/Druck
+  if (mi.uordblks > g_heapUsedMax) g_heapUsedMax = mi.uordblks;
+  c.print(",\"heap_used_max\":"); c.print(g_heapUsedMax);
+  c.print(",\"reset_reason\":\""); c.print(gigaResetReason); c.print("\"");
+  c.print(",\"rssi\":");          c.print(WiFi.RSSI());
+  c.print(",\"base_restored\":"); c.print(baseRestored ? "true" : "false");
+  c.print(",\"boots\":");         c.print(g_bootCount);
   c.print("}");
 }
 
@@ -651,6 +722,10 @@ void handleApi() {
 // ───────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  gigaResetReason = gigaResetStr(mbed::ResetReason::get());   // Reset-Ursache merken
+  { unsigned long b = 0; size_t a = 0;                        // persistierter Boot-Zaehler ++
+    if (kv_get("boots", &b, sizeof(b), &a) != 0) b = 0;
+    b++; kv_set("boots", &b, sizeof(b), 0); g_bootCount = b; }
   display.begin();
   display.setRotation(ROTATION);
   drawStaticLayout();
