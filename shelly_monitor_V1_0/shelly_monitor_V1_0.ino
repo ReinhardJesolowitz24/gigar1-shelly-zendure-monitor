@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.1"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.2"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -125,12 +125,11 @@ int dbBms = 0, dbSoc = 0, dbBal = 0, dbWarn = 0;
 int shState = 0, znState = 0;
 int shFailCount = 0;                 // aufeinanderfolgende Shelly-Fehlversuche (Entprellung)
 const int SH_FAIL_N = 3;             // "Shelly-Fehler" erst nach 3 Fehlern in Folge (transiente Blips ignorieren)
-unsigned int shOut = 0, znOut = 0;        // Ausfall-Episoden kumuliert (ok -> nicht-ok)
-unsigned int pshOut = 0, pznOut = 0;      // Snapshot der letzten Mitternacht
+unsigned int shOut = 0, znOut = 0;        // Ausfall-Episoden (taeglich um Mitternacht + bei Neustart auf 0)
 int  zFault = 0, zErr = 0;                  // BMS faultLevel / is_error
 const char* alarmText = "";
 bool dumpPrev = false, socPrev = false, faultPrev = false;   // Flankenerkennung
-unsigned int cntDump = 0, cntSoc = 0, cntFault = 0;          // Ereigniszaehler (Reset nur bei Neustart)
+unsigned int cntDump = 0, cntSoc = 0, cntFault = 0;          // Ereigniszaehler (Reset taeglich um Mitternacht + bei Neustart)
 
 // Differenzierung: gelbe Warnung (faultLevel) vs roter Kritisch-Alarm
 bool warnActive = false, warnPrev = false;
@@ -155,7 +154,6 @@ const int DAY_HIST = 30;
 DayRec dayHist[DAY_HIST];
 int dayHead = 0, dayStored = 0;
 unsigned int dayCount = 0;
-unsigned int pbms = 0, ptief = 0, pnetz = 0, pbal = 0, pwarn = 0;   // Zaehler-Snapshot der letzten Mitternacht
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -584,15 +582,15 @@ bool fetchSlow() {
       dayHist[dayHead].bezug = (impWh - impBase) / 1000.0;
       dayHist[dayHead].einsp = (retWh - retBase) / 1000.0;
       dayHist[dayHead].saldo = dayHist[dayHead].einsp - dayHist[dayHead].bezug;
-      dayHist[dayHead].bms  = cntFault   - pbms;     // Ereignisse an DIESEM Tag (Delta)
-      dayHist[dayHead].tief = cntSoc     - ptief;
-      dayHist[dayHead].netz = cntDump    - pnetz;
-      dayHist[dayHead].bal  = cntBalance - pbal;
-      dayHist[dayHead].warn = cntWarn    - pwarn;
-      dayHist[dayHead].shout = shOut - pshOut;
-      dayHist[dayHead].znout = znOut - pznOut;
-      pbms = cntFault; ptief = cntSoc; pnetz = cntDump; pbal = cntBalance; pwarn = cntWarn;
-      pshOut = shOut; pznOut = znOut;
+      dayHist[dayHead].bms  = cntFault;     // Tageswerte (Zaehler liefen seit Mitternacht ab 0)
+      dayHist[dayHead].tief = cntSoc;
+      dayHist[dayHead].netz = cntDump;
+      dayHist[dayHead].bal  = cntBalance;
+      dayHist[dayHead].warn = cntWarn;
+      dayHist[dayHead].shout = shOut;
+      dayHist[dayHead].znout = znOut;
+      cntFault = 0; cntSoc = 0; cntDump = 0; cntBalance = 0; cntWarn = 0;   // Live-Zaehler -> 0: Dashboard startet ruhig in den neuen Tag
+      shOut = 0; znOut = 0;
       dayHead = (dayHead + 1) % DAY_HIST;
       if (dayStored < DAY_HIST) dayStored++;
       impBase = impWh; retBase = retWh;
