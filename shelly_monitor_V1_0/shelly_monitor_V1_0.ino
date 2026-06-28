@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.2"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.3"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -99,7 +99,7 @@ void wdFeed() { if ((uint32_t)(millis() - g_lastLoopMs) < WD_WINDOW_MS) mbed::Wa
 // ── Messwerte ────────────────────────────────────────────────────────────────
 float gTotal = 0;
 float pA=0,pB=0,pC=0, uA=0,uB=0,uC=0, iA=0,iB=0,iC=0;
-int   zSoc=-1, zOut=0, zAc=-1;
+int   zSoc=-1, zOut=0, zAc=-1, zChg=0;   // zChg = Ladeleistung (gridInputPower) -> "Aufnahme"
 
 // Zeit + Tagessaldo
 String curTime = "--:--";
@@ -185,7 +185,7 @@ void printCentered(const char* text, int y, uint8_t sz, uint16_t color) {
 // (weniger Framebuffer-Schreibzugriffe -> ruhigeres Bild, weniger Last; identisch zur ESP32-Variante)
 long dcTotal = -999999L;
 long dcP[3] = {-999999L,-999999L,-999999L}, dcU[3] = {-999999L,-999999L,-999999L}, dcI[3] = {-999999L,-999999L,-999999L};
-int  dcSoc = -999, dcZOut = -999, dcZAc = -999, dcZnState = -999;
+int  dcSoc = -999, dcZOut = -999, dcZAc = -999, dcZnState = -999, dcZChg = -999;
 long dcSaldo = -999999L, dcBezug = -999999L, dcEinsp = -999999L;
 char dcTime[8] = "";
 long dcCntF=-1, dcCntS=-1, dcCntD=-1, dcCntB=-1, dcCntW=-1;
@@ -193,7 +193,7 @@ char dcStatus[64] = ""; uint16_t dcStatusCol = 0xFFFF;
 void invalidateDirtyCache() {   // erzwingt Neuzeichnen aller dynamischen Felder (nach Vollbild-Repaint)
   dcTotal = -999999L;
   for (int k=0;k<3;k++){ dcP[k]=dcU[k]=dcI[k]=-999999L; }
-  dcSoc=dcZOut=dcZAc=dcZnState=-999;
+  dcSoc=dcZOut=dcZAc=dcZnState=dcZChg=-999;
   dcSaldo=dcBezug=dcEinsp=-999999L;
   dcTime[0]=0;
   dcCntF=dcCntS=dcCntD=dcCntB=dcCntW=-1;
@@ -262,14 +262,18 @@ void drawPhases() {
 }
 
 void drawZendure() {
-  if (zSoc==dcSoc && zOut==dcZOut && zAc==dcZAc && znState==dcZnState) return;   // unveraendert
-  dcSoc=zSoc; dcZOut=zOut; dcZAc=zAc; dcZnState=znState;
+  if (zSoc==dcSoc && zOut==dcZOut && zAc==dcZAc && znState==dcZnState && zChg==dcZChg) return;   // unveraendert
+  dcSoc=zSoc; dcZOut=zOut; dcZAc=zAc; dcZnState=znState; dcZChg=zChg;
   display.fillRect(0, 300, SCREEN_W, 20, COL_BG);
   char buf[70];
   if      (znState == 2) snprintf(buf, sizeof(buf), "Zendure: OFFLINE (kein TCP)");
   else if (znState == 1) snprintf(buf, sizeof(buf), "Zendure: API haengt (Geraet laeuft)");
   else if (zSoc < 0)     snprintf(buf, sizeof(buf), "Zendure: (keine Antwort)");
-  else                   snprintf(buf, sizeof(buf), "Zendure (HEMS):  SoC %d%%   Abgabe %d W   acStatus %d", zSoc, zOut, zAc);
+  else {
+    const char* dir = (zChg > 0) ? "Aufnahme" : "Abgabe";   // laedt -> Aufnahme, sonst Abgabe (0=idle)
+    int dirW = (zChg > 0) ? zChg : zOut;
+    snprintf(buf, sizeof(buf), "Zendure (HEMS):  SoC %d%%   %s %d W   acStatus %d", zSoc, dir, dirW, zAc);
+  }
   printCentered(buf, 302, 2, COL_ZEN);
 }
 
@@ -522,6 +526,7 @@ bool fetchZendure() {
   JsonObject pr = doc["properties"]; if (pr.isNull()) return false;
   zSoc   = pr["electricLevel"] | -1;
   zOut   = pr["outputHomePower"] | 0;
+  zChg   = pr["gridInputPower"]  | 0;   // AC-Ladeleistung -> "Aufnahme"
   zAc    = pr["acStatus"] | -1;
   zFault = pr["faultLevel"] | 0;
   zErr   = pr["is_error"] | 0;
@@ -628,6 +633,7 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"einsp_kwh\":");     c.print(einspKwh, 3);
   c.print(",\"soc\":");           c.print(zSoc);
   c.print(",\"zout_w\":");        c.print(zOut);
+  c.print(",\"zchg_w\":");        c.print(zChg);
   c.print(",\"faultlevel\":");    c.print(zFault);
   c.print(",\"is_error\":");      c.print(zErr);
   c.print(",\"spread_max_mv\":"); c.print(balSpreadMax);
