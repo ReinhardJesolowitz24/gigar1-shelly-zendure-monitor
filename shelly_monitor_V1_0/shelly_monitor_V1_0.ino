@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.4"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.5"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -629,6 +629,7 @@ void sendJsonStatus(WiFiClient& c) {
   c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
   unsigned long uptime = (bootEpoch > 0 && sysEpoch >= bootEpoch) ? (sysEpoch - bootEpoch) : (millis() / 1000);  // aus Shelly-Zeit, sonst Fallback
   c.print("{\"fw\":\"" FW_VERSION "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"uptime_s\":");      c.print(uptime);
+  c.print(",\"uptime_mcu_s\":"); c.print(millis() / 1000);   // interner Quarz-Counter; (uptime_mcu_s - uptime_s) = Drift, + = Quarz laeuft vor
   c.print(",\"time\":\"");        c.print(curTime); c.print("\"");
   c.print(",\"netz_w\":");        c.print(gTotal, 0);
   c.print(",\"saldo_kwh\":");     c.print(saldoKwh, 3);
