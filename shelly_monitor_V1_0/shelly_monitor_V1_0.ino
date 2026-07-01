@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.3"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.4"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -148,7 +148,7 @@ int balHead = 0;      // naechster Schreibindex im Ring
 int balStored = 0;    // belegte Eintraege (max BAL_HIST)
 
 // Tagessaldo-Historie (Ringpuffer der letzten 30 Tage)
-unsigned long sysEpoch = 0;   // Unixzeit vom Shelly (Datums-Stempel)
+unsigned long sysEpoch = 0, bootEpoch = 0;   // sysEpoch=Unixzeit vom Shelly; bootEpoch=Boot-Zeit für genaue Uptime-Berechnung
 struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; unsigned int bms, tief, netz, bal, warn, shout, znout; };
 const int DAY_HIST = 30;
 DayRec dayHist[DAY_HIST];
@@ -553,7 +553,9 @@ bool fetchSlow() {
     JsonDocument d; if (!deserializeJson(d, httpBuf)) {
       const char* tm = d["time"] | "";
       if (strlen(tm) >= 4) curTime = String(tm);
-      sysEpoch = d["unixtime"] | sysEpoch;
+      unsigned long newEpoch = d["unixtime"] | sysEpoch;
+      if (bootEpoch == 0 && newEpoch > 0) bootEpoch = newEpoch;  // Boot-Zeit beim ersten Mal merken
+      sysEpoch = newEpoch;
     }
   }
   if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, "/rpc/EMData.GetStatus?id=0", httpBuf, sizeof(httpBuf))) return false;
@@ -625,7 +627,8 @@ void updateHealth(int& state, unsigned int& outCnt, bool apiOk, const char* host
 
 void sendJsonStatus(WiFiClient& c) {
   c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
-  c.print("{\"fw\":\"" FW_VERSION "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"uptime_s\":");      c.print(millis() / 1000);
+  unsigned long uptime = (bootEpoch > 0 && sysEpoch >= bootEpoch) ? (sysEpoch - bootEpoch) : (millis() / 1000);  // aus Shelly-Zeit, sonst Fallback
+  c.print("{\"fw\":\"" FW_VERSION "\",\"build\":\"" __DATE__ " " __TIME__ "\",\"uptime_s\":");      c.print(uptime);
   c.print(",\"time\":\"");        c.print(curTime); c.print("\"");
   c.print(",\"netz_w\":");        c.print(gTotal, 0);
   c.print(",\"saldo_kwh\":");     c.print(saldoKwh, 3);
