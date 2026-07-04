@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.5"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.6"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -553,7 +553,13 @@ bool fetchSlow() {
     JsonDocument d; if (!deserializeJson(d, httpBuf)) {
       const char* tm = d["time"] | "";
       if (strlen(tm) >= 4) curTime = String(tm);
-      unsigned long newEpoch = d["unixtime"] | sysEpoch;
+      // Defensiv: unixtime als double lesen und runden, FALLS eine kuenftige Shelly-FW
+      // Sekundenbruchteile liefern sollte. Aktuell sendet Shelly Integer-Sekunden (geprueft) ->
+      // Ergebnis identisch zum simplen Integer-Read. ACHTUNG: korrekt nur, weil double hier 64-bit
+      // ist (ESP32-S3 / GIGA-H7); auf float=32-bit wuerde 1.78e9 auf Vielfache von 128 gerundet!
+      double rawEpoch = d["unixtime"] | 0.0;
+      unsigned long newEpoch = (unsigned long)(rawEpoch + 0.5);  // Runden statt Truncation
+      if (newEpoch == 0) newEpoch = sysEpoch;  // kein/ungueltiges unixtime -> letzten Wert behalten
       if (bootEpoch == 0 && newEpoch > 0) bootEpoch = newEpoch;  // Boot-Zeit beim ersten Mal merken
       sysEpoch = newEpoch;
     }
