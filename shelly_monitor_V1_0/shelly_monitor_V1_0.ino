@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.6"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.7"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -139,6 +139,25 @@ bool balanceActive = false, balancePrev = false;
 unsigned int cntBalance = 0;
 int balSpread = 0, balSpreadMax = 0;   // Zellspreizung beim Balancing (mV): letzte + groesste je gesehene
 
+// ── Control-Watch (L3-Kachel): ueberwacht lokalen Regler + Broker, Default AUS ──────
+// Zeigt oben eine Kachel "CONTROL OK" (gruen) bzw. "REGLER/BROKER/CONTROL DOWN" (rot),
+// wenn Regler oder Broker MEHR ALS CONTROL_FAIL_N Abfragen in Folge nicht antworten.
+// AKTIVIEREN: CONTROL_WATCH_ENABLE auf 1 setzen UND in arduino_secrets.h
+//   SECRET_REGLER_HOST + SECRET_BROKER_HOST eintragen (feste IPs des Steuer-Duos).
+// Default AUS, weil ein Nutzer OHNE lokalen Regler (z.B. reine Cloud-/HEMS-Regelung)
+// sonst faelschlich Dauer-Rot saehe. Rein LESEND (GET /status) -> stoert nichts.
+#define CONTROL_WATCH_ENABLE 1
+#if CONTROL_WATCH_ENABLE
+const char* CTRL_REGLER_HOST = SECRET_REGLER_HOST;
+const char* CTRL_BROKER_HOST = SECRET_BROKER_HOST;
+const unsigned long CONTROL_POLL_MS = 20000;   // Abfrage-Intervall (20 s)
+const int  CONTROL_FAIL_N = 3;                 // >CONTROL_FAIL_N Fehlversuche in Folge -> ROT (>3 ~ 80 s Stille bei 20 s-Takt)
+unsigned long lastCtrlPoll = 0;
+int ctrlFailR = 0, ctrlFailB = 0;              // aufeinanderfolgende Fehlversuche je Ziel
+int ctrlState = -1;                            // -1=unbekannt, 0=ok, 1=Regler weg, 2=Broker weg, 3=beide weg
+int dcCtrl    = -2;                            // Dirty-Cache (Kachel nur bei Aenderung neu zeichnen)
+#endif
+
 // JSON-API (eigener HTTP-Server)
 WiFiServer apiServer(80);
 struct BalEvent { unsigned int id; char tm[8]; int soc; int cMax; int cMin; int spread; };
@@ -198,6 +217,9 @@ void invalidateDirtyCache() {   // erzwingt Neuzeichnen aller dynamischen Felder
   dcTime[0]=0;
   dcCntF=dcCntS=dcCntD=dcCntB=dcCntW=-1;
   dcStatus[0]=0;
+#if CONTROL_WATCH_ENABLE
+  dcCtrl = -2;
+#endif
 }
 
 void drawStaticLayout() {
@@ -296,6 +318,25 @@ void drawStatus(const char* text, uint16_t color) {
   printCentered(text, 452, 2, color);
 }
 
+#if CONTROL_WATCH_ENABLE
+void drawControl(int st) {   // Kachel oben rechts (zwischen Titel und Uhr). Nur bei Aenderung neu zeichnen.
+  if (st == dcCtrl) return;
+  dcCtrl = st;
+  uint16_t col; const char* t;
+  switch (st) {
+    case 0:  col = COL_EINSPEIS; t = "CONTROL OK";   break;   // beide antworten -> gruen
+    case 1:  col = COL_BEZUG;    t = "REGLER DOWN";  break;   // Regler stumm -> rot
+    case 2:  col = COL_BEZUG;    t = "BROKER DOWN";  break;   // Broker stumm -> rot
+    case 3:  col = COL_BEZUG;    t = "CONTROL DOWN"; break;   // beide weg -> rot
+    default: col = COL_UNIT;     t = "CONTROL ?";    break;   // -1 = noch keine Abfrage -> grau
+  }
+  display.fillRoundRect(454, 6, 150, 30, 4, col);
+  int tw = (int)strlen(t) * 6 * 2;
+  display.setTextSize(2); display.setTextColor(COL_BG, col); display.setTextWrap(false);
+  display.setCursor(454 + (150 - tw) / 2, 14); display.print(t);
+}
+#endif
+
 void drawCounters() {
   if ((long)cntFault==dcCntF && (long)cntSoc==dcCntS && (long)cntDump==dcCntD && (long)cntBalance==dcCntB && (long)cntWarn==dcCntW) return;  // unveraendert
   dcCntF=cntFault; dcCntS=cntSoc; dcCntD=cntDump; dcCntB=cntBalance; dcCntW=cntWarn;
@@ -393,6 +434,9 @@ void evalAlarm(unsigned long now) {
 void repaintAll() {
   invalidateDirtyCache();   // nach Vollbild-Loeschung muessen alle dynamischen Felder neu gezeichnet werden
   drawStaticLayout(); drawTime(); drawTotal(gTotal); drawPhases(); drawZendure(); drawSaldo(); drawCounters();
+#if CONTROL_WATCH_ENABLE
+  drawControl(ctrlState);
+#endif
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -450,6 +494,25 @@ bool httpGetBody(const char* host, int port, const char* path, char* out, size_t
   client.stop();
   return n > 0;
 }
+
+#if CONTROL_WATCH_ENABLE
+// Leichtgewichtiger Liveness-Check: GET /status, nur Statuszeile lesen (200 = lebt).
+// Numerische IP direkt (kein DNS-Hang), kurze Timeouts -> blockiert die Anzeige nur kurz.
+bool controlAlive(const char* host) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient client; client.setTimeout(2500);
+  IPAddress ipAddr; bool gotIp = ipAddr.fromString(host);
+  bool conOk = gotIp ? client.connect(ipAddr, 80) : client.connect(host, 80);
+  if (!conOk) { client.stop(); return false; }                   // kein TCP -> tot
+  client.print("GET /status HTTP/1.0\r\nHost: monitor\r\nConnection: close\r\n\r\n");
+  unsigned long t = millis();
+  while (!client.available() && millis() - t < 2500) delay(5);   // max 2,5 s auf Antwort
+  bool ok = false;
+  if (client.available()) { String s = client.readStringUntil('\n'); ok = (s.indexOf("200") != -1); }
+  client.stop();
+  return ok;
+}
+#endif
 
 int parseMinuteOfDay(const String& t) {
   int c = t.indexOf(':'); if (c < 1) return -1;
@@ -665,6 +728,11 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"rssi\":");          c.print(WiFi.RSSI());
   c.print(",\"base_restored\":"); c.print(baseRestored ? "true" : "false");
   c.print(",\"boots\":");         c.print(g_bootCount);
+#if CONTROL_WATCH_ENABLE
+  c.print(",\"ctrl_state\":");    c.print(ctrlState);     // -1=unbek,0=ok,1=Regler,2=Broker,3=beide weg
+  c.print(",\"ctrl_fail_r\":");   c.print(ctrlFailR);
+  c.print(",\"ctrl_fail_b\":");   c.print(ctrlFailB);
+#endif
   c.print("}");
 }
 
@@ -749,6 +817,9 @@ void setup() {
   drawCounters();
   connectWiFi();   // OHNE Watchdog -> beliebig viel Zeit fuer die Erstverbindung
   apiServer.begin();   // JSON-API starten (nach WLAN-Verbindung)
+#if CONTROL_WATCH_ENABLE
+  drawControl(ctrlState);   // graue "CONTROL ?"-Kachel bis zur ersten Abfrage
+#endif
 
   // Hardware-Watchdog ERST JETZT starten (nach erfolgreicher WLAN-Verbindung),
   // damit ein langsamer Verbindungsaufbau keinen Reboot-Loop ausloest.
@@ -817,6 +888,23 @@ void loop() {
       }
     }
   }
+
+#if CONTROL_WATCH_ENABLE
+  // L3-Kachel: Regler + Broker auf Lebenszeichen pruefen (alle CONTROL_POLL_MS).
+  // Eigener Timer, unabhaengig von der Shelly/Zendure-Sequenz. Kurze Timeouts -> blockiert
+  // nur wenige Sekunden; der Fenster-Watchdog fuettert waehrenddessen normal weiter.
+  if (WiFi.status() == WL_CONNECTED && now - lastCtrlPoll >= CONTROL_POLL_MS) {
+    lastCtrlPoll = now;
+    bool rOk = controlAlive(CTRL_REGLER_HOST);
+    bool bOk = controlAlive(CTRL_BROKER_HOST);
+    ctrlFailR = rOk ? 0 : ctrlFailR + 1;
+    ctrlFailB = bOk ? 0 : ctrlFailB + 1;
+    bool rDown = ctrlFailR > CONTROL_FAIL_N;   // "mehr als CONTROL_FAIL_N in Folge"
+    bool bDown = ctrlFailB > CONTROL_FAIL_N;
+    ctrlState = (rDown && bDown) ? 3 : (rDown ? 1 : (bDown ? 2 : 0));
+    drawControl(ctrlState);
+  }
+#endif
 
   // Waechter-Anzeige: blinkender roter Rahmen + Banner bei Fehlbetrieb
   if (alarmActive) {

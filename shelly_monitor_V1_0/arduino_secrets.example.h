@@ -13,4 +13,9 @@
 #define SECRET_SHELLY_HOST "192.168.1.50"          // lokale IP des Shelly Pro 3EM
 #define SECRET_ZEN_HOST    "192.168.1.51"          // lokale IP des Zendure SolarFlow
 
+// Optional -- nur noetig, wenn CONTROL_WATCH_ENABLE im Sketch auf 1 gesetzt ist.
+// IPs des lokalen Nulleinspeisungs-Duos (Regler + MQTT-Broker).
+#define SECRET_REGLER_HOST "192.168.1.52"          // Regler (controller)
+#define SECRET_BROKER_HOST "192.168.1.53"          // MQTT-Broker
+
 #endif
