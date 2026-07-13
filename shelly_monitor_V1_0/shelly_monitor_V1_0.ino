@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.7"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
+#define FW_VERSION "giga-1.9"   // in /status gemeldet (Feld "fw"); "build" = Compile-Zeit erkennt veraltete Flashes
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -146,12 +146,13 @@ int balSpread = 0, balSpreadMax = 0;   // Zellspreizung beim Balancing (mV): let
 //   SECRET_REGLER_HOST + SECRET_BROKER_HOST eintragen (feste IPs des Steuer-Duos).
 // Default AUS, weil ein Nutzer OHNE lokalen Regler (z.B. reine Cloud-/HEMS-Regelung)
 // sonst faelschlich Dauer-Rot saehe. Rein LESEND (GET /status) -> stoert nichts.
-#define CONTROL_WATCH_ENABLE 1
+#define CONTROL_WATCH_ENABLE 0
 #if CONTROL_WATCH_ENABLE
 const char* CTRL_REGLER_HOST = SECRET_REGLER_HOST;
 const char* CTRL_BROKER_HOST = SECRET_BROKER_HOST;
 const unsigned long CONTROL_POLL_MS = 20000;   // Abfrage-Intervall (20 s)
 const int  CONTROL_FAIL_N = 3;                 // >CONTROL_FAIL_N Fehlversuche in Folge -> ROT (>3 ~ 80 s Stille bei 20 s-Takt)
+const unsigned long CONTROL_IO_MS = 1000;      // Connect-/Read-Timeout je controlAlive (2026-07-13, war 2500). GIGA: mbed-connect nimmt keinen Timeout-Arg -> nur setTimeout; ARP zu totem Subnetz-Host kann laenger sein -> Wirkung per Broker-Aus-Test verifizieren
 unsigned long lastCtrlPoll = 0;
 int ctrlFailR = 0, ctrlFailB = 0;              // aufeinanderfolgende Fehlversuche je Ziel
 int ctrlState = -1;                            // -1=unbekannt, 0=ok, 1=Regler weg, 2=Broker weg, 3=beide weg
@@ -224,7 +225,7 @@ void invalidateDirtyCache() {   // erzwingt Neuzeichnen aller dynamischen Felder
 
 void drawStaticLayout() {
   display.fillScreen(COL_BG);
-  printAt(20, 8, "Shelly Pro 3EM - Monitor", 3, COL_TITLE);
+  printAt(20, 8, "Shelly-Zendure-Guard", 3, COL_TITLE);
   display.drawFastHLine(10, 42, SCREEN_W - 20, COL_LINE);
 
   printCentered("Netz gesamt [W]   (gruen=Einspeisung / rot=Bezug)", 50, 2, COL_UNIT);
@@ -246,12 +247,12 @@ void drawStaticLayout() {
 void drawTime() {
   if (strcmp(curTime.c_str(), dcTime) == 0) return;     // unveraendert -> nicht neu zeichnen
   strncpy(dcTime, curTime.c_str(), sizeof(dcTime) - 1); dcTime[sizeof(dcTime) - 1] = 0;
-  display.fillRect(630, 6, SCREEN_W - 630, 34, COL_BG);
-  printAt(660, 12, curTime.c_str(), 3, COL_VAL);
+  display.fillRect(660, 6, SCREEN_W - 660, 34, COL_BG);
+  printAt(680, 12, curTime.c_str(), 3, COL_VAL);
 }
 
 void drawHeartbeat(bool on) {
-  display.fillCircle(615, 22, 6, on ? COL_EINSPEIS : COL_BG);   // gruener Punkt blinkt (Sketch lebt)
+  display.fillCircle(625, 22, 6, on ? COL_EINSPEIS : COL_BG);   // gruener Punkt blinkt (Sketch lebt)
 }
 
 void drawTotal(float p) {
@@ -330,10 +331,10 @@ void drawControl(int st) {   // Kachel oben rechts (zwischen Titel und Uhr). Nur
     case 3:  col = COL_BEZUG;    t = "CONTROL DOWN"; break;   // beide weg -> rot
     default: col = COL_UNIT;     t = "CONTROL ?";    break;   // -1 = noch keine Abfrage -> grau
   }
-  display.fillRoundRect(454, 6, 150, 30, 4, col);
+  display.fillRoundRect(420, 6, 150, 30, 4, col);
   int tw = (int)strlen(t) * 6 * 2;
   display.setTextSize(2); display.setTextColor(COL_BG, col); display.setTextWrap(false);
-  display.setCursor(454 + (150 - tw) / 2, 14); display.print(t);
+  display.setCursor(420 + (150 - tw) / 2, 14); display.print(t);
 }
 #endif
 
@@ -500,13 +501,13 @@ bool httpGetBody(const char* host, int port, const char* path, char* out, size_t
 // Numerische IP direkt (kein DNS-Hang), kurze Timeouts -> blockiert die Anzeige nur kurz.
 bool controlAlive(const char* host) {
   if (WiFi.status() != WL_CONNECTED) return false;
-  WiFiClient client; client.setTimeout(2500);
+  WiFiClient client; client.setTimeout(CONTROL_IO_MS);
   IPAddress ipAddr; bool gotIp = ipAddr.fromString(host);
   bool conOk = gotIp ? client.connect(ipAddr, 80) : client.connect(host, 80);
   if (!conOk) { client.stop(); return false; }                   // kein TCP -> tot
   client.print("GET /status HTTP/1.0\r\nHost: monitor\r\nConnection: close\r\n\r\n");
   unsigned long t = millis();
-  while (!client.available() && millis() - t < 2500) delay(5);   // max 2,5 s auf Antwort
+  while (!client.available() && millis() - t < CONTROL_IO_MS) delay(5);   // max CONTROL_IO_MS auf Antwort
   bool ok = false;
   if (client.available()) { String s = client.readStringUntil('\n'); ok = (s.indexOf("200") != -1); }
   client.stop();
