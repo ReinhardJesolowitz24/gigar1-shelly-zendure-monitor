@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.11"  // 1.11: Control-Watch um "ZENDURE STALE" (Zustand 5) erweitert -- liest tele_stale vom Regler, entprellt (>CONTROL_ZEN_STALE_N Polls) -> erkennt eingefrorene/nicht-antwortende Zendure (Geraete-Freeze) 24/7, unabhaengig vom Notebook. Basis 1.10. // in /status (Feld "fw"); "build" = Compile-Zeit
+#define FW_VERSION "giga-1.12"  // 1.12: Kachel-Label auf "ZEN STALE" gekuerzt (passt sauber in die 150px-Kachel). Basis 1.11 (Control-Watch Zustand 5, Freeze-Erkennung via tele_stale vom Regler, entprellt, 24/7). // in /status (Feld "fw"); "build" = Compile-Zeit
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -332,7 +332,7 @@ void drawControl(int st) {   // Kachel oben rechts (zwischen Titel und Uhr). Nur
     case 2:  col = COL_BEZUG;    t = "BROKER DOWN";  break;   // Broker stumm -> rot
     case 3:  col = COL_BEZUG;    t = "CONTROL DOWN"; break;   // beide weg -> rot
     case 4:  col = COL_BEZUG;    t = "MQTT DOWN";    break;   // Boxen leben, aber Zendure/Regler nicht am Broker (clients<MIN) -> Kreis offen
-    case 5:  col = COL_ZEN;      t = "ZENDURE STALE";break;   // Regler+Broker leben, aber Zendure-Telemetrie eingefroren (Geraete-Freeze) -> gelbe Warnung
+    case 5:  col = COL_ZEN;      t = "ZEN STALE";    break;   // Regler+Broker leben, aber Zendure-Telemetrie eingefroren (Geraete-Freeze) -> gelbe Warnung
     default: col = COL_UNIT;     t = "CONTROL ?";    break;   // -1 = noch keine Abfrage -> grau
   }
   display.fillRoundRect(420, 6, 150, 30, 4, col);
