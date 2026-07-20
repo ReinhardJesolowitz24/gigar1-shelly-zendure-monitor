@@ -41,7 +41,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.13"  // 1.13: kumulativer KVStore-persistenter ZEN-STALE-Ereigniszaehler (zen_stale_count in /status), ++1 je Eintritt in Zustand 5 -> Freeze-Ueberwachung per gelegentlicher Abfrage, kein Notebook-Logger noetig. Basis 1.12 (Label ZEN STALE; 1.11 Control-Watch Zustand 5). // in /status (Feld "fw"); "build" = Compile-Zeit
+#define FW_VERSION "giga-1.14"  // 1.14: kumulative persistente Zaehler jetzt fuer ALLE Control-Watch-Zustaende (regler_down/broker_down/control_down/mqtt_down_count + zen_stale_count in /status), ++1 je Zustands-Eintritt, KVStore-persistent -> komplette Langzeit-Zuverlaessigkeits-Historie per Abfrage. Basis 1.13 (zen_stale_count). // in /status (Feld "fw"); "build" = Compile-Zeit
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -570,6 +570,7 @@ struct SaldoNVM { long day; double imp; double ret; };
 bool baseRestored = false;        // Baseline aus NVM wiederhergestellt (true) oder frisch (false)?
 unsigned long g_bootCount = 0;    // persistierter Boot-Zaehler (erkennt unbeobachtete Reboots)
 uint32_t g_zenStaleCount = 0;     // kumulativer ZEN-STALE-Ereigniszaehler (KVStore-persistent): ++1 je Eintritt in Zustand 5
+uint32_t g_reglerDownCount = 0, g_brokerDownCount = 0, g_controlDownCount = 0, g_mqttDownCount = 0; // dito je Eintritt in Zustand 1/2/3/4 (KVStore-persistent)
 long g_heapUsedMax = 0;           // hoechster heap_used (uordblks) seit Boot -> Leck-Indikator
 const char* gigaResetReason = "?";   // beim Boot aus mbed::ResetReason gesetzt
 const char* gigaResetStr(reset_reason_t r) {
@@ -776,6 +777,10 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"ctrl_fail_m\":");   c.print(ctrlFailM);
   c.print(",\"ctrl_fail_z\":");   c.print(ctrlFailZ);
   c.print(",\"zen_stale_count\":"); c.print(g_zenStaleCount);   // kumulativ, KVStore-persistent -> Freeze-Ueberwachung per Abfrage
+  c.print(",\"regler_down_count\":");  c.print(g_reglerDownCount);
+  c.print(",\"broker_down_count\":");  c.print(g_brokerDownCount);
+  c.print(",\"control_down_count\":"); c.print(g_controlDownCount);
+  c.print(",\"mqtt_down_count\":");    c.print(g_mqttDownCount);
 #endif
   c.print("}");
 }
@@ -854,6 +859,11 @@ void setup() {
     b++; kv_set("boots", &b, sizeof(b), 0); g_bootCount = b; }
   { uint32_t z = 0; size_t a = 0;                            // kumulativen ZEN-STALE-Zaehler laden (ueberlebt Reboot)
     if (kv_get("zenstale", &z, sizeof(z), &a) != 0) z = 0; g_zenStaleCount = z; }
+  { uint32_t v = 0; size_t a = 0;                            // uebrige Zustands-Zaehler laden (ueberlebt Reboot)
+    if (kv_get("reglerdown",  &v, sizeof(v), &a) != 0) v = 0; g_reglerDownCount  = v;
+    if (kv_get("brokerdown",  &v, sizeof(v), &a) != 0) v = 0; g_brokerDownCount  = v;
+    if (kv_get("controldown", &v, sizeof(v), &a) != 0) v = 0; g_controlDownCount = v;
+    if (kv_get("mqttdown",    &v, sizeof(v), &a) != 0) v = 0; g_mqttDownCount    = v; }
   display.begin();
   display.setRotation(ROTATION);
   drawStaticLayout();
@@ -958,9 +968,14 @@ void loop() {
     bool zenStale = ctrlFailZ > CONTROL_ZEN_STALE_N;
     int prevCtrlState = ctrlState;
     ctrlState = (rDown && bDown) ? 3 : (rDown ? 1 : (bDown ? 2 : (mqttDown ? 4 : (zenStale ? 5 : 0))));
-    if (ctrlState == 5 && prevCtrlState != 5) {        // NEUES ZEN-STALE-Ereignis (Eintritt) -> kumulativen Zaehler ++ und KVStore-persistent sichern
-      g_zenStaleCount++;
-      kv_set("zenstale", &g_zenStaleCount, sizeof(g_zenStaleCount), 0);
+    if (ctrlState != prevCtrlState && ctrlState >= 1) {   // NEUER Problem-Zustand (Eintritt) -> passenden kumulativen Zaehler ++ und KVStore-persistent sichern
+      switch (ctrlState) {
+        case 1: g_reglerDownCount++;  kv_set("reglerdown",  &g_reglerDownCount,  sizeof(g_reglerDownCount),  0); break;
+        case 2: g_brokerDownCount++;  kv_set("brokerdown",  &g_brokerDownCount,  sizeof(g_brokerDownCount),  0); break;
+        case 3: g_controlDownCount++; kv_set("controldown", &g_controlDownCount, sizeof(g_controlDownCount), 0); break;
+        case 4: g_mqttDownCount++;    kv_set("mqttdown",    &g_mqttDownCount,    sizeof(g_mqttDownCount),    0); break;
+        case 5: g_zenStaleCount++;    kv_set("zenstale",    &g_zenStaleCount,    sizeof(g_zenStaleCount),    0); break;
+      }
     }
     drawControl(ctrlState);
   }
