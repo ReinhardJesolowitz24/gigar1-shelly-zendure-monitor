@@ -68,9 +68,13 @@ The `/status` API gained matching diagnostics:
 
 ## Libraries
 
+Validated toolchain (current build):
+
 - **ArduinoJson** (>= 7.x)
-- **Arduino_GigaDisplay_GFX**
-- **Arduino Mbed OS GIGA Boards** core (provides `mbed` for the hardware watchdog)
+- **Arduino_GigaDisplay_GFX 1.1.0** — GFX driver for the GIGA Display Shield.
+- **Arduino Mbed OS GIGA Boards 4.6.0** (core) — provides `mbed` for the hardware watchdog (STM32H7 IWDG) and the KVStore used by the persistent counters. Board: **Arduino Giga R1**.
+
+> Unlike the ESP32 monitor, the GIGA needs **no special Tools settings** (no PSRAM / partition / flash-mode choices) — just select the **Arduino Giga R1** board.
 
 ## Optional: Control-Watch tile (local controller supervision)
 
