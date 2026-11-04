@@ -3,7 +3,7 @@
  * Board  : Arduino Giga R1 WiFi
  * Shield : Arduino Giga Display Shield (800x480, Querformat)
  *
- * NUR LESEN. Schreibt NICHTS an den Zendure -> stoert die Cloud-/HEMS-Regelung nicht.
+ * NUR LESEN. Schreibt NICHTS an den Zendure -> stoert weder Cloud-HEMS noch einen lokalen Regler.
  *
  * Anzeige:
  *   - Uhrzeit (vom Shelly, lokal/DST-korrekt) oben rechts + Heartbeat-Punkt
@@ -11,7 +11,10 @@
  *   - pro Phase L1/L2/L3: Wirkleistung [W], Spannung [V], Strom [A]
  *   - Zendure (read-only): SoC, Abgabe, acStatus
  *   - Tagessaldo [kWh] seit 0:00 Uhr (+ = mehr Einspeisung, - = mehr Bezug),
- *     Reset automatisch um Mitternacht (aus echten Shelly-Energiezaehlern)
+ *     Reset automatisch um Mitternacht (aus echten Shelly-Energiezaehlern).
+ *     Hinweis: Bezug/Einspeisung = Shelly total_act/total_act_ret = JE PHASE brutto summiert. Speist eine
+ *     Phase ein, waehrend eine andere bezieht, zaehlen beide -> Bezug UND Einspeisung erscheinen hoeher als
+ *     an einem phasen-saldierenden Netzzaehler. Der Saldo (Einspeisung - Bezug) entspricht dem Netto.
  *   - Waechter: roter Alarm bei Netz-Dumping / Tiefentladung / BMS-Fehler,
  *     mit Ereigniszaehlern. Plus Hardware-Watchdog (Selbstueberwachung).
  *
@@ -110,7 +113,7 @@ double impBase=0, retBase=0;       // Basis seit 0:00 Uhr
 bool   baseSet=false;
 double bezugKwh=0, einspKwh=0, saldoKwh=0;
 
-// Waechter / Alarm: Akku entlaedt UND Netz speist ein = HEMS-Fehlbetrieb
+// Waechter / Alarm: Akku entlaedt UND Netz speist ein = Regel-Fehlbetrieb (Cloud-HEMS oder lokaler Regler)
 const float         ALARM_OUT  = 200.0;    // W Zendure-Abgabe-Schwelle
 const float         ALARM_EXP  = 300.0;    // W Netz-Einspeisung (Monitor positiv)
 const unsigned long ALARM_HOLD = 30000;    // ms anhaltend, bevor Alarm ausloest
@@ -462,8 +465,9 @@ void connectWiFi() {
 
     // Im Betrieb: erst nach 10 min erfolglosem Reconnect Board neu starten lassen.
     // (Grosszuegig, damit ein Router-SW-Update / Netz-Ausfall von mehreren min KEINEN
-    //  Neustart ausloest - ein Ein/Aus dauert je nach Router schon 3-4 min. Watchdog
-    //  wird bis dahin weiter gefuettert; erst dann NICHT mehr -> Reset wie HW-Reset.)
+    //  Neustart ausloest - ein Ein/Aus dauert je nach Router schon 3-4 min.)
+    //  HINWEIS: Da loop() hier nicht weiterlaeuft, greift VORHER der Fenster-Watchdog (WD_WINDOW_MS 9 min,
+    //  Reset nach ~9,5 min). Dieser 10-min-Pfad ist damit nur noch Rueckfallebene.
     if (wdtActive && (millis() - t0 >= 600000)) {
       drawStatus("Reconnect fehlgeschlagen -> Neustart", COL_BEZUG);
       Serial.println("RECONNECT FEHLGESCHLAGEN -> NEUSTART (Watchdog)");   // im Serial-Log sichtbar
@@ -771,7 +775,7 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"base_restored\":"); c.print(baseRestored ? "true" : "false");
   c.print(",\"boots\":");         c.print(g_bootCount);
 #if CONTROL_WATCH_ENABLE
-  c.print(",\"ctrl_state\":");    c.print(ctrlState);     // -1=unbek,0=ok,1=Regler,2=Broker,3=beide weg
+  c.print(",\"ctrl_state\":");    c.print(ctrlState);     // -1=unbek,0=ok,1=Regler,2=Broker,3=beide,4=MQTT down,5=ZEN STALE
   c.print(",\"ctrl_fail_r\":");   c.print(ctrlFailR);
   c.print(",\"ctrl_fail_b\":");   c.print(ctrlFailB);
   c.print(",\"ctrl_fail_m\":");   c.print(ctrlFailM);
