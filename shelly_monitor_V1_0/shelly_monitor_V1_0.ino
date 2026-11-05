@@ -7,7 +7,8 @@
  *
  * Anzeige:
  *   - Uhrzeit (vom Shelly, lokal/DST-korrekt) oben rechts + Heartbeat-Punkt
- *   - Netz gesamt (gross, gruen=Einspeisung / rot=Bezug)
+ *   - grosses Feld oben, geteilt: links Netz gesamt [W] (gruen=Einspeisung / rot=Bezug),
+ *     rechts Zendure-SoC [%] in gleicher Groesse (rot <=40, gelb 41-79, gruen >=80) -> von weitem lesbar
  *   - pro Phase L1/L2/L3: Wirkleistung [W], Spannung [V], Strom [A]
  *   - Zendure (read-only): SoC, Abgabe, acStatus
  *   - Tagessaldo [kWh] seit 0:00 Uhr (+ = mehr Einspeisung, - = mehr Bezug),
@@ -44,7 +45,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.15"  // 1.15: CONTROL_IO_MS 1000->1750 (Poll-Timeout): 750ms beob. Regler-Kalt-Poll-Max + 1000ms Reserve -> eliminiert falsche REGLER/CONTROL DOWN durch Netz-/Kalt-Connect-Jitter (Signal-Reinheit: Zaehler = echtes Problem). Basis 1.14 (kumulative Zustands-Zaehler). // in /status (Feld "fw"); "build" = Compile-Zeit
+#define FW_VERSION "giga-1.16"  // 1.16: grosses Feld oben geteilt -> links Netz gesamt [W], rechts Zendure-SoC [%] gross + farbig (rot <=40 / gelb 41-79 / gruen >=80); sonst unveraendert. 1.15: CONTROL_IO_MS 1000->1750 (Poll-Timeout): 750ms beob. Regler-Kalt-Poll-Max + 1000ms Reserve -> eliminiert falsche REGLER/CONTROL DOWN durch Netz-/Kalt-Connect-Jitter (Signal-Reinheit: Zaehler = echtes Problem). Basis 1.14 (kumulative Zustands-Zaehler). // in /status (Feld "fw"); "build" = Compile-Zeit
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -204,6 +205,12 @@ void printCentered(const char* text, int y, uint8_t sz, uint16_t color) {
   if (x < 0) x = 0;
   printAt(x, y, text, sz, color);
 }
+void printCenteredIn(const char* text, int x0, int w, int y, uint8_t sz, uint16_t color) {   // zentriert in [x0, x0+w)
+  int16_t tw = strlen(text) * 6 * sz;
+  int16_t x  = x0 + (w - tw) / 2;
+  if (x < x0) x = x0;
+  printAt(x, y, text, sz, color);
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // ── Dirty-Cache: nur neu zeichnen, wenn sich der Wert geaendert hat ───────────
@@ -211,6 +218,7 @@ void printCentered(const char* text, int y, uint8_t sz, uint16_t color) {
 long dcTotal = -999999L;
 long dcP[3] = {-999999L,-999999L,-999999L}, dcU[3] = {-999999L,-999999L,-999999L}, dcI[3] = {-999999L,-999999L,-999999L};
 int  dcSoc = -999, dcZOut = -999, dcZAc = -999, dcZnState = -999, dcZChg = -999;
+int  dcSocBig = -999;   // grosse SoC-Anzeige rechts oben (-1 = kein gueltiger Wert)
 long dcSaldo = -999999L, dcBezug = -999999L, dcEinsp = -999999L;
 char dcTime[8] = "";
 long dcCntF=-1, dcCntS=-1, dcCntD=-1, dcCntB=-1, dcCntW=-1;
@@ -219,6 +227,7 @@ void invalidateDirtyCache() {   // erzwingt Neuzeichnen aller dynamischen Felder
   dcTotal = -999999L;
   for (int k=0;k<3;k++){ dcP[k]=dcU[k]=dcI[k]=-999999L; }
   dcSoc=dcZOut=dcZAc=dcZnState=dcZChg=-999;
+  dcSocBig=-999;
   dcSaldo=dcBezug=dcEinsp=-999999L;
   dcTime[0]=0;
   dcCntF=dcCntS=dcCntD=dcCntB=dcCntW=-1;
@@ -233,7 +242,10 @@ void drawStaticLayout() {
   printAt(20, 8, "Shelly-Zendure-Guard", 3, COL_TITLE);
   display.drawFastHLine(10, 42, SCREEN_W - 20, COL_LINE);
 
-  printCentered("Netz gesamt [W]   (gruen=Einspeisung / rot=Bezug)", 50, 2, COL_UNIT);
+  // Grosses Feld geteilt: links Netz gesamt, rechts Zendure-SoC (Trennlinie bei x=400)
+  printCenteredIn("Netz  gruen=Einsp. / rot=Bezug", 0, 400, 50, 2, COL_UNIT);
+  printCenteredIn("Zendure SoC", 400, 400, 50, 2, COL_UNIT);
+  display.drawFastVLine(400, 48, 98, COL_LINE);
   display.drawFastHLine(10, 150, SCREEN_W - 20, COL_LINE);
 
   printAt(CX_L1, 162, "L1", 2, COL_TITLE);
@@ -264,9 +276,23 @@ void drawTotal(float p) {
   long v = lroundf(p);
   if (v == dcTotal) return;                              // gleicher gerundeter Wert -> nicht neu zeichnen
   dcTotal = v;
-  display.fillRect(0, 78, SCREEN_W, 68, COL_BG);
-  char buf[20]; snprintf(buf, sizeof(buf), "%.0f", p);
-  printCentered(buf, 82, 7, (p < 0) ? COL_BEZUG : COL_EINSPEIS);
+  display.fillRect(0, 78, 400, 68, COL_BG);             // nur linke Haelfte (Trennlinie x=400 bleibt)
+  char buf[20]; snprintf(buf, sizeof(buf), "%.0f W", p);
+  printCenteredIn(buf, 0, 400, 82, 7, (p < 0) ? COL_BEZUG : COL_EINSPEIS);
+}
+
+void drawSocBig() {   // rechte Haelfte des grossen Felds: Zendure-SoC, gleiche Groesse wie Netz gesamt
+  int v = (znState == 0) ? zSoc : -1;                    // haengt/offline -> "--" statt altem Wert
+  if (v == dcSocBig) return;                             // unveraendert -> nicht neu zeichnen
+  dcSocBig = v;
+  display.fillRect(401, 78, SCREEN_W - 401, 68, COL_BG);
+  char buf[12]; uint16_t col;
+  if (v < 0) { snprintf(buf, sizeof(buf), "-- %%"); col = COL_UNIT; }
+  else {
+    snprintf(buf, sizeof(buf), "%d %%", v);
+    col = (v <= 40) ? COL_BEZUG : (v >= 80) ? COL_EINSPEIS : COL_ZEN;   // rot <=40 / gelb 41-79 / gruen >=80
+  }
+  printCenteredIn(buf, 400, 400, 82, 7, col);
 }
 
 void drawCell(int x, int y, float val, const char* fmt, bool colorBySign) {
@@ -290,6 +316,7 @@ void drawPhases() {
 }
 
 void drawZendure() {
+  drawSocBig();   // grosse SoC-Anzeige oben (eigener Dirty-Cache)
   if (zSoc==dcSoc && zOut==dcZOut && zAc==dcZAc && znState==dcZnState && zChg==dcZChg) return;   // unveraendert
   dcSoc=zSoc; dcZOut=zOut; dcZAc=zAc; dcZnState=znState; dcZChg=zChg;
   display.fillRect(0, 300, SCREEN_W, 20, COL_BG);
@@ -873,6 +900,7 @@ void setup() {
   drawStaticLayout();
   drawTime();
   drawTotal(0);
+  drawSocBig();   // "-- %" bis zur ersten Zendure-Antwort
   drawSaldo();
   drawCounters();
   connectWiFi();   // OHNE Watchdog -> beliebig viel Zeit fuer die Erstverbindung
