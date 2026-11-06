@@ -18,6 +18,9 @@
  *     an einem phasen-saldierenden Netzzaehler. Der Saldo (Einspeisung - Bezug) entspricht dem Netto.
  *   - Waechter: roter Alarm bei Netz-Dumping / Tiefentladung / BMS-Fehler,
  *     mit Ereigniszaehlern. Plus Hardware-Watchdog (Selbstueberwachung).
+ *   - Tages-Datensatz (dayrec.h): 1000 Tage persistent im KVStore (QSPI), inkl. Regler-/Broker-Daten
+ *     und unabhaengiger Regelguete. API: /daily[?from=<seq>&n=<1..31>]  /daily/cur  /daily/info
+ *     ACHTUNG: QSPIFormat NIE erneut ausfuehren -> loescht den KVStore (Ring, Saldo-Basis, Zaehler).
  *
  * Vorzeichen (invertiert): negativ = Bezug, positiv = Einspeisung.
  *   (Je nach Montagerichtung der Stromzangen ggf. das *-1 anpassen.)
@@ -41,11 +44,13 @@
 #include "ResetReason.h"        // mbed: Reset-Ursache (WATCHDOG/POWER_ON/...) -> /status reset_reason
 #include <malloc.h>           // mallinfo() -> Heap-Diagnose (Leck/Fragmentierung sichtbar)
 #include "arduino_secrets.h"  // WLAN + Geraete-IPs (NICHT eingecheckt)
+// #define DR_TEST_DAY_MIN 10  // NUR Prueflauf: "Tag" = 10 min, eigener Speicherbereich (vor dayrec.h setzen)
+#include "dayrec.h"           // persistenter Tages-Datensatz (1000 Tage, identisch im ESP32-Repo)
 
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.16"  // 1.16: grosses Feld oben geteilt -> links Netz gesamt [W], rechts Zendure-SoC [%] gross + farbig (rot <=40 / gelb 41-79 / gruen >=80); sonst unveraendert. 1.15: CONTROL_IO_MS 1000->1750 (Poll-Timeout): 750ms beob. Regler-Kalt-Poll-Max + 1000ms Reserve -> eliminiert falsche REGLER/CONTROL DOWN durch Netz-/Kalt-Connect-Jitter (Signal-Reinheit: Zaehler = echtes Problem). Basis 1.14 (kumulative Zustands-Zaehler). // in /status (Feld "fw"); "build" = Compile-Zeit
+#define FW_VERSION "giga-1.19"  // 1.19: Tages-Datensatz-Drift (w_drift_ppm_x10) korrigiert: beide Uhren ueber dieselbe Strecke (millis() beim Empfang der Shelly-Zeit gemerkt) statt millis()/1000 vs. Shelly-Uptime -> vorher ~25 s Boot-Versatz + Abfrage-Jitter (1.18 zeigte 941 statt ~360 ppm); Drift erst ab 6 h Laufzeit; /status uptime_mcu_s unveraendert. 1.18: persistenter Tages-Datensatz (dayrec.h, 1000 Tage x 192 B im KVStore) inkl. Regler-/Broker-Block + Regelguete; /daily neu (Paging), /daily/cur, /daily/info; Regler/Broker-/status 1x/min voll gelesen (gleiche Anfrage); Tageswechsel jetzt ueber Tagesnummer statt Minutensprung (greift auch nach Ausfall ueber Mitternacht). 1.17: grosses SoC-Feld zeigt bei Zendure-Fehlversuch/Pause den letzten Wert GRAU statt "-- %" ("-- %" nur bis zum ersten Wert). 1.16: grosses Feld oben geteilt -> links Netz gesamt [W], rechts Zendure-SoC [%] gross + farbig (rot <=40 / gelb 41-79 / gruen >=80); sonst unveraendert. 1.15: CONTROL_IO_MS 1000->1750 (Poll-Timeout): 750ms beob. Regler-Kalt-Poll-Max + 1000ms Reserve -> eliminiert falsche REGLER/CONTROL DOWN durch Netz-/Kalt-Connect-Jitter (Signal-Reinheit: Zaehler = echtes Problem). Basis 1.14 (kumulative Zustands-Zaehler). // in /status (Feld "fw"); "build" = Compile-Zeit
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -108,10 +113,12 @@ int   zSoc=-1, zOut=0, zAc=-1, zChg=0;   // zChg = Ladeleistung (gridInputPower)
 // Zeit + Tagessaldo
 String curTime = "--:--";
 String myIp = "0.0.0.0";            // eigene IP der GIGA (fuer Anzeige)
-int    prevMod = -1;               // vorheriger Minute-im-Tag-Wert (Mitternacht-Erkennung)
+long   g_curDay = -1;              // lokale Tagesnummer des laufenden Tages (Tageswechsel-Erkennung)
 double impWh=0, retWh=0;           // aktuelle Zaehlerstaende (Wh)
 double impBase=0, retBase=0;       // Basis seit 0:00 Uhr
 bool   baseSet=false;
+bool   g_baseMidnight=false;       // Basis wurde um Mitternacht gesetzt (gilt fuer den ganzen Tag)
+unsigned long lastDrMin = 0;       // Minuten-Takt fuer den Tages-Datensatz
 double bezugKwh=0, einspKwh=0, saldoKwh=0;
 
 // Waechter / Alarm: Akku entlaedt UND Netz speist ein = Regel-Fehlbetrieb (Cloud-HEMS oder lokaler Regler)
@@ -163,6 +170,7 @@ const int  CONTROL_ZEN_STALE_N = 6;            // >N tele_stale-Polls in Folge (
 int ctrlFailR = 0, ctrlFailB = 0, ctrlFailM = 0, ctrlFailZ = 0; // aufeinanderfolgende Fehlversuche je Ziel (M=Broker lebt aber clients<MIN; Z=Regler lebt aber tele_stale)
 int ctrlState = -1;                            // -1=unbekannt, 0=ok, 1=Regler weg, 2=Broker weg, 3=beide weg, 4=MQTT down (clients<MIN), 5=ZENDURE STALE (Regler lebt, tele_stale)
 int dcCtrl    = -2;                            // Dirty-Cache (Kachel nur bei Aenderung neu zeichnen)
+unsigned int ctrlPollN = 0;                    // jede 3. Abfrage (= 1x/min) /status voll lesen -> Tages-Datensatz
 #endif
 
 // JSON-API (eigener HTTP-Server)
@@ -173,13 +181,9 @@ BalEvent balHist[BAL_HIST];
 int balHead = 0;      // naechster Schreibindex im Ring
 int balStored = 0;    // belegte Eintraege (max BAL_HIST)
 
-// Tagessaldo-Historie (Ringpuffer der letzten 30 Tage)
+// Tages-Historie: persistenter Ring in dayrec.h (ersetzt den frueheren 30-Tage-RAM-Puffer)
 unsigned long sysEpoch = 0, bootEpoch = 0;   // sysEpoch=Unixzeit vom Shelly; bootEpoch=Boot-Zeit für genaue Uptime-Berechnung
-struct DayRec { unsigned int id; unsigned long epoch; float saldo; float bezug; float einsp; unsigned int bms, tief, netz, bal, warn, shout, znout; };
-const int DAY_HIST = 30;
-DayRec dayHist[DAY_HIST];
-int dayHead = 0, dayStored = 0;
-unsigned int dayCount = 0;
+unsigned long sysEpochMs = 0, bootEpochMs = 0; // millis() beim Empfang von sysEpoch/bootEpoch -> Drift ohne Versatz/Jitter
 int cellMax = 0, cellMin = 9999, tempMax = 0;   // worst-case Zellwerte ueber alle Packs
 const int CELL_MAX_CRIT = 370;    // 3.70 V echte Ueberspannung (normale LFP-Vollladung ~3.5-3.65 V; Einheit 0.01 V)
 const int CELL_MIN_CRIT = 260;    // 2.60 V Unterspannung
@@ -282,15 +286,18 @@ void drawTotal(float p) {
 }
 
 void drawSocBig() {   // rechte Haelfte des grossen Felds: Zendure-SoC, gleiche Groesse wie Netz gesamt
-  int v = (znState == 0) ? zSoc : -1;                    // haengt/offline -> "--" statt altem Wert
-  if (v == dcSocBig) return;                             // unveraendert -> nicht neu zeichnen
-  dcSocBig = v;
+  int  v     = zSoc;                                     // letzter gueltiger Wert (bleibt bei Fehlversuch erhalten)
+  bool stale = (znState != 0);                           // haengt/offline -> letzter Wert grau
+  int  key   = (v < 0) ? -1 : v * 2 + (stale ? 1 : 0);
+  if (key == dcSocBig) return;                           // unveraendert -> nicht neu zeichnen
+  dcSocBig = key;
   display.fillRect(401, 78, SCREEN_W - 401, 68, COL_BG);
   char buf[12]; uint16_t col;
-  if (v < 0) { snprintf(buf, sizeof(buf), "-- %%"); col = COL_UNIT; }
+  if (v < 0) { snprintf(buf, sizeof(buf), "-- %%"); col = COL_UNIT; }   // noch nie ein Wert
   else {
     snprintf(buf, sizeof(buf), "%d %%", v);
-    col = (v <= 40) ? COL_BEZUG : (v >= 80) ? COL_EINSPEIS : COL_ZEN;   // rot <=40 / gelb 41-79 / gruen >=80
+    if (stale) col = COL_UNIT;                                          // veraltet -> grau
+    else col = (v <= 40) ? COL_BEZUG : (v >= 80) ? COL_EINSPEIS : COL_ZEN;   // rot <=40 / gelb 41-79 / gruen >=80
   }
   printCenteredIn(buf, 400, 400, 82, 7, col);
 }
@@ -583,6 +590,34 @@ int controlBrokerClients(const char* host) {
   char* q = strstr(buf, "\"clients_connected\":");
   return q ? atoi(q + 20) : CONTROL_MIN_CLIENTS;   // Feld nicht gefunden -> fail-safe als OK werten (kein Fehlalarm)
 }
+
+// Voller /status-Abruf (Statuszeile + kompletter JSON-Body nach out) mit denselben kurzen Timeouts wie controlAlive.
+// Ersetzt 1x pro Minute die leichte Abfrage (gleiche Anfrage, nur ganz gelesen) -> Daten fuer den Tages-Datensatz.
+// Rueckgabe true = HTTP 200 (= lebt), auch wenn der Body unvollstaendig sein sollte.
+bool controlFetchStatus(const char* host, char* out, size_t outSize) {
+  out[0] = 0;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient client; client.setTimeout(CONTROL_IO_MS);
+  IPAddress ipAddr; bool gotIp = ipAddr.fromString(host);
+  bool conOk = gotIp ? client.connect(ipAddr, 80) : client.connect(host, 80);
+  if (!conOk) { client.stop(); return false; }
+  client.print("GET /status HTTP/1.0\r\nHost: monitor\r\nConnection: close\r\n\r\n");
+  unsigned long t = millis();
+  while (!client.available() && millis() - t < CONTROL_IO_MS) delay(5);
+  bool ok = false;
+  if (client.available()) { String s = client.readStringUntil('\n'); ok = (s.indexOf("200") != -1); }
+  if (ok) {
+    size_t n = 0; unsigned long t2 = millis();
+    while ((client.connected() || client.available()) && n < outSize - 1 && millis() - t2 < CONTROL_IO_MS) {
+      if (client.available()) out[n++] = (char)client.read(); else delay(2);
+    }
+    out[n] = 0;
+    char* b = strstr(out, "\r\n\r\n");                 // Header ueberspringen -> nur JSON-Body behalten
+    if (b) memmove(out, b + 4, strlen(b + 4) + 1);
+  }
+  client.stop();
+  return ok;
+}
 #endif
 
 int parseMinuteOfDay(const String& t) {
@@ -644,6 +679,38 @@ bool tryRestoreBaseline() {        // Baseline aus NVM holen, falls vom selben T
   return false;
 }
 
+// Live-Werte fuer den Tages-Datensatz (dayrec.h)
+void drLive(DrLive& l) {
+  l.today = localDayNumber();
+  l.minuteOfDay = parseMinuteOfDay(curTime);
+  l.epoch = sysEpoch;
+  l.baseFull = baseRestored || g_baseMidnight;
+  l.bezugWh = impWh - impBase;  l.einspWh = retWh - retBase;
+  l.netzW = (int)lroundf(gTotal); l.shellyOk = (shState == 0);
+  l.soc = zSoc; l.zenOk = (znState == 0) && (zSoc >= 0); l.socGrenze = SOC_MIN_ALARM;
+  l.znState = znState; l.shState = shState;
+#if CONTROL_WATCH_ENABLE
+  l.ctrlState = ctrlState;
+#else
+  l.ctrlState = 0;
+#endif
+  l.cnt[0] = g_reglerDownCount; l.cnt[1] = g_brokerDownCount; l.cnt[2] = g_controlDownCount;
+  l.cnt[3] = g_mqttDownCount;   l.cnt[4] = g_zenStaleCount;
+  l.cnt[5] = shOut;  l.cnt[6] = znOut;  l.cnt[7] = cntFault; l.cnt[8] = cntSoc;
+  l.cnt[9] = cntDump; l.cnt[10] = cntBalance; l.cnt[11] = cntWarn;
+  l.rssi = (WiFi.status() == WL_CONNECTED) ? (int8_t)WiFi.RSSI() : 0;
+  struct mallinfo mi = mallinfo();
+  l.freeHeap = (uint32_t)mi.fordblks;      // frei im Arena (wie heap_free in /status)
+  l.uptimeS = (bootEpoch > 0 && sysEpoch >= bootEpoch) ? (sysEpoch - bootEpoch) : 0;
+  // Drift: beide Uhren ueber DIESELBE Strecke (erste -> letzte Shelly-Zeit) -> kein Boot-Versatz, kein Abfrage-Jitter;
+  // millis()-Ueberlauf (49,7 d) ueber die Shelly-Uptime rekonstruiert (Drift << 2^31 ms)
+  if (l.uptimeS > 0) {
+    uint64_t ms = (uint32_t)(sysEpochMs - bootEpochMs);
+    while (ms + 0x80000000ULL < (uint64_t)l.uptimeS * 1000ULL) ms += 0x100000000ULL;
+    l.uptimeMcuS = (uint32_t)((ms + 500) / 1000);
+  } else l.uptimeMcuS = millis() / 1000;
+}
+
 bool fetchShelly() {
   if (!httpGetBody(SHELLY_HOST, SHELLY_PORT, SHELLY_PATH, httpBuf, sizeof(httpBuf))) return false;
   JsonDocument doc; if (deserializeJson(doc, httpBuf)) return false;
@@ -695,8 +762,10 @@ bool fetchSlow() {
       // ist (ESP32-S3 / GIGA-H7); auf float=32-bit wuerde 1.78e9 auf Vielfache von 128 gerundet!
       double rawEpoch = d["unixtime"] | 0.0;
       unsigned long newEpoch = (unsigned long)(rawEpoch + 0.5);  // Runden statt Truncation
+      unsigned long nowMs = millis();  // Zeitpunkt dieser Shelly-Zeit (Drift-Messung im Tages-Datensatz)
       if (newEpoch == 0) newEpoch = sysEpoch;  // kein/ungueltiges unixtime -> letzten Wert behalten
-      if (bootEpoch == 0 && newEpoch > 0) bootEpoch = newEpoch;  // Boot-Zeit beim ersten Mal merken
+      else sysEpochMs = nowMs;
+      if (bootEpoch == 0 && newEpoch > 0) { bootEpoch = newEpoch; bootEpochMs = nowMs; }  // Boot-Zeit beim ersten Mal merken
       sysEpoch = newEpoch;
     }
   }
@@ -720,32 +789,22 @@ bool fetchSlow() {
     }
   }
 
-  // Mitternacht: Minute-im-Tag springt von ~23:xx (>1380) auf <01:00 (<60)
-  int mod = parseMinuteOfDay(curTime);
-  if (mod >= 0) {
-    if (prevMod > 1380 && mod < 60) {
-      // Tag zu Ende: Tages-Saldo in den Ringpuffer sichern, DANN Basis zuruecksetzen
-      dayCount++;
-      dayHist[dayHead].id    = dayCount;
-      dayHist[dayHead].epoch = sysEpoch;
-      dayHist[dayHead].bezug = (impWh - impBase) / 1000.0;
-      dayHist[dayHead].einsp = (retWh - retBase) / 1000.0;
-      dayHist[dayHead].saldo = dayHist[dayHead].einsp - dayHist[dayHead].bezug;
-      dayHist[dayHead].bms  = cntFault;     // Tageswerte (Zaehler liefen seit Mitternacht ab 0)
-      dayHist[dayHead].tief = cntSoc;
-      dayHist[dayHead].netz = cntDump;
-      dayHist[dayHead].bal  = cntBalance;
-      dayHist[dayHead].warn = cntWarn;
-      dayHist[dayHead].shout = shOut;
-      dayHist[dayHead].znout = znOut;
+  // Tages-Datensatz: alten Tag abschliessen, BEVOR unten Zaehler und Basis zurueckgesetzt werden
+  { DrLive dl; drLive(dl); drCheckDay(dl); }
+
+  // Tageswechsel: lokale Tagesnummer steigt (robuster als der fruehere Minutensprung 23:xx -> 00:xx,
+  // greift auch, wenn um Mitternacht laenger keine Abfrage durchkam)
+  long today = localDayNumber();
+  if (today >= 0) {
+    if (g_curDay >= 0 && today > g_curDay) {
       cntFault = 0; cntSoc = 0; cntDump = 0; cntBalance = 0; cntWarn = 0;   // Live-Zaehler -> 0: Dashboard startet ruhig in den neuen Tag
       shOut = 0; znOut = 0;
-      dayHead = (dayHead + 1) % DAY_HIST;
-      if (dayStored < DAY_HIST) dayStored++;
+      drCountersReset();                         // Tages-Datensatz: genullte Zaehler nicht als Ruecksprung werten
       impBase = impWh; retBase = retWh;
       saveBaseline();                            // neuen Tag ins NVM persistieren
+      g_baseMidnight = true;
     }
-    prevMod = mod;
+    g_curDay = today;
   }
 
   bezugKwh = (impWh - impBase) / 1000.0;
@@ -813,6 +872,7 @@ void sendJsonStatus(WiFiClient& c) {
   c.print(",\"control_down_count\":"); c.print(g_controlDownCount);
   c.print(",\"mqtt_down_count\":");    c.print(g_mqttDownCount);
 #endif
+  drJsonStatusFields(c);          // Tages-Datensatz: Speicher ok, Anzahl, letzte seq, Schreibfehler, Minuten heute
   c.print("}");
 }
 
@@ -836,32 +896,6 @@ void sendJsonBalance(WiFiClient& c) {
   c.print("]}");
 }
 
-void sendJsonDaily(WiFiClient& c) {
-  c.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
-  c.print("{\"count\":"); c.print(dayCount);
-  c.print(",\"stored\":"); c.print(dayStored);
-  c.print(",\"days\":[");
-  int start = (dayStored < DAY_HIST) ? 0 : dayHead;     // aeltester Tag zuerst
-  for (int i = 0; i < dayStored; i++) {
-    int idx = (start + i) % DAY_HIST;
-    if (i) c.print(",");
-    c.print("{\"id\":");          c.print(dayHist[idx].id);
-    c.print(",\"epoch\":");       c.print(dayHist[idx].epoch);
-    c.print(",\"saldo_kwh\":");   c.print(dayHist[idx].saldo, 3);
-    c.print(",\"bezug_kwh\":");   c.print(dayHist[idx].bezug, 3);
-    c.print(",\"einsp_kwh\":");   c.print(dayHist[idx].einsp, 3);
-    c.print(",\"bms\":");   c.print(dayHist[idx].bms);
-    c.print(",\"tief\":");  c.print(dayHist[idx].tief);
-    c.print(",\"netz\":");  c.print(dayHist[idx].netz);
-    c.print(",\"bal\":");   c.print(dayHist[idx].bal);
-    c.print(",\"warn\":");  c.print(dayHist[idx].warn);
-    c.print(",\"shout\":"); c.print(dayHist[idx].shout);
-    c.print(",\"znout\":"); c.print(dayHist[idx].znout);
-    c.print("}");
-  }
-  c.print("]}");
-}
-
 void handleApi() {
   WiFiClient c = apiServer.available();
   if (!c) return;
@@ -870,12 +904,14 @@ void handleApi() {
   while (!c.available() && millis() - t < 800) delay(1);
   String req = c.readStringUntil('\n');                 // "GET /pfad HTTP/1.1"
   while (c.connected() && c.available()) { String l = c.readStringUntil('\n'); if (l.length() <= 1) break; }
-  if      (req.indexOf("/balance") >= 0) sendJsonBalance(c);
-  else if (req.indexOf("/daily")   >= 0) sendJsonDaily(c);
-  else if (req.indexOf("/status")  >= 0) sendJsonStatus(c);
+  if      (req.indexOf("/balance")    >= 0) sendJsonBalance(c);
+  else if (req.indexOf("/daily/info") >= 0) drJsonInfo(c);
+  else if (req.indexOf("/daily/cur")  >= 0) drJsonCur(c);
+  else if (req.indexOf("/daily")      >= 0) drJsonDaily(c, req);
+  else if (req.indexOf("/status")     >= 0) sendJsonStatus(c);
   else {
     c.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
-    c.print("ShellyMonitor API:  /status   /balance   /daily");
+    c.print("ShellyMonitor API:  /status   /balance   /daily[?from=<seq>&n=<1..31>]   /daily/cur   /daily/info");
   }
   delay(2);
   c.stop();
@@ -895,6 +931,7 @@ void setup() {
     if (kv_get("brokerdown",  &v, sizeof(v), &a) != 0) v = 0; g_brokerDownCount  = v;
     if (kv_get("controldown", &v, sizeof(v), &a) != 0) v = 0; g_controlDownCount = v;
     if (kv_get("mqttdown",    &v, sizeof(v), &a) != 0) v = 0; g_mqttDownCount    = v; }
+  drBegin(FW_VERSION, g_bootCount);   // Tages-Datensatz: Ring scannen + Checkpoint laden (vor dem Watchdog-Start)
   display.begin();
   display.setRotation(ROTATION);
   drawStaticLayout();
@@ -944,6 +981,7 @@ void loop() {
         if (shOk) {
           shFailCount = 0;
           updateHealth(shState, shOut, true, SHELLY_HOST);
+          drOnShelly((int)lroundf(gTotal));      // Tages-Datensatz: Netz-Spitzen
           drawTotal(gTotal); drawPhases();
           evalAlarm(now);
           drawCounters();
@@ -963,7 +1001,9 @@ void loop() {
       }
       else if (step == 1) {                    // Zendure (read-only)
         if (millis() >= znPauseUntil) {        // nur abfragen, wenn keine Zendure-Pause laeuft
+          unsigned long tz = millis();
           bool zk = fetchZendure();
+          drOnZendure(zk, millis() - tz, zOut, zChg, cellMax, cellMin, tempMax);   // Tages-Datensatz: Energie-Integral, Spitzen, Zellen, Antwortzeit
           updateHealth(znState, znOut, zk, ZEN_HOST);
           if (!zk) znPauseUntil = millis() + ZEN_PAUSE_MS;   // haengt/offline -> 5 min Pause
           else     znPauseUntil = 0;                          // antwortet wieder -> normal
@@ -984,8 +1024,20 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && now - lastCtrlPoll >= CONTROL_POLL_MS) {
     lastCtrlPoll = now;
     bool teleStale = false;
-    bool rOk = controlAlive(CTRL_REGLER_HOST, &teleStale);
-    int  bClients = controlBrokerClients(CTRL_BROKER_HOST);   // >=0 = Broker lebt (clients-Zahl), -1 = tot
+    bool rOk;
+    int  bClients;                             // >=0 = Broker lebt (clients-Zahl), -1 = tot
+    if (++ctrlPollN % 3 == 0) {                // 1x pro Minute: dieselbe Anfrage, aber /status ganz lesen -> Tages-Datensatz
+      rOk = controlFetchStatus(CTRL_REGLER_HOST, httpBuf, sizeof(httpBuf));
+      if (rOk) { JsonDocument d; if (!deserializeJson(d, httpBuf)) { teleStale = d["tele_stale"] | false; drOnRegler(d); } }
+      bClients = -1;
+      if (controlFetchStatus(CTRL_BROKER_HOST, httpBuf, sizeof(httpBuf))) {
+        bClients = CONTROL_MIN_CLIENTS;        // Body nicht lesbar -> fail-safe als OK werten (wie controlBrokerClients)
+        JsonDocument d; if (!deserializeJson(d, httpBuf)) { bClients = d["clients_connected"] | CONTROL_MIN_CLIENTS; drOnBroker(d); }
+      }
+    } else {
+      rOk = controlAlive(CTRL_REGLER_HOST, &teleStale);
+      bClients = controlBrokerClients(CTRL_BROKER_HOST);
+    }
     bool bOk = (bClients >= 0);
     ctrlFailR = rOk ? 0 : ctrlFailR + 1;
     ctrlFailB = bOk ? 0 : ctrlFailB + 1;
@@ -1012,6 +1064,9 @@ void loop() {
     drawControl(ctrlState);
   }
 #endif
+
+  // Tages-Datensatz: Minuten-Takt (Zaehler, Min/Max, Zustands-Minuten; stuendlich Checkpoint in den KVStore)
+  if (now - lastDrMin >= 60000UL) { lastDrMin = now; drMinute(); }
 
   // Waechter-Anzeige: blinkender roter Rahmen + Banner bei Fehlbetrieb
   if (alarmActive) {
