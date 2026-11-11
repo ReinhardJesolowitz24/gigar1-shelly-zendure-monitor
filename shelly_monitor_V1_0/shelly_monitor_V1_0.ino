@@ -50,7 +50,7 @@
 GigaDisplay_GFX display;
 
 #define ROTATION   1
-#define FW_VERSION "giga-1.19"  // 1.19: Tages-Datensatz-Drift (w_drift_ppm_x10) korrigiert: beide Uhren ueber dieselbe Strecke (millis() beim Empfang der Shelly-Zeit gemerkt) statt millis()/1000 vs. Shelly-Uptime -> vorher ~25 s Boot-Versatz + Abfrage-Jitter (1.18 zeigte 941 statt ~360 ppm); Drift erst ab 6 h Laufzeit; /status uptime_mcu_s unveraendert. 1.18: persistenter Tages-Datensatz (dayrec.h, 1000 Tage x 192 B im KVStore) inkl. Regler-/Broker-Block + Regelguete; /daily neu (Paging), /daily/cur, /daily/info; Regler/Broker-/status 1x/min voll gelesen (gleiche Anfrage); Tageswechsel jetzt ueber Tagesnummer statt Minutensprung (greift auch nach Ausfall ueber Mitternacht). 1.17: grosses SoC-Feld zeigt bei Zendure-Fehlversuch/Pause den letzten Wert GRAU statt "-- %" ("-- %" nur bis zum ersten Wert). 1.16: grosses Feld oben geteilt -> links Netz gesamt [W], rechts Zendure-SoC [%] gross + farbig (rot <=40 / gelb 41-79 / gruen >=80); sonst unveraendert. 1.15: CONTROL_IO_MS 1000->1750 (Poll-Timeout): 750ms beob. Regler-Kalt-Poll-Max + 1000ms Reserve -> eliminiert falsche REGLER/CONTROL DOWN durch Netz-/Kalt-Connect-Jitter (Signal-Reinheit: Zaehler = echtes Problem). Basis 1.14 (kumulative Zustands-Zaehler). // in /status (Feld "fw"); "build" = Compile-Zeit
+#define FW_VERSION "giga-1.20"  // 1.20: Tages-Datensatz-Minutentakt im festen Raster (lastDrMin += 60 s statt = now) -> Loop-Verspaetung summierte sich auf (1.19: 1418 statt 1440 min/Tag, INCOMPLETE-Flag jeden Tag, m_*-Minuten ~2 % zu klein); nach >5 min Blockade Neuaufsetzen. 1.19: Tages-Datensatz-Drift (w_drift_ppm_x10) korrigiert: beide Uhren ueber dieselbe Strecke (millis() beim Empfang der Shelly-Zeit gemerkt) statt millis()/1000 vs. Shelly-Uptime -> vorher ~25 s Boot-Versatz + Abfrage-Jitter (1.18 zeigte 941 statt ~360 ppm); Drift erst ab 6 h Laufzeit; /status uptime_mcu_s unveraendert. 1.18: persistenter Tages-Datensatz (dayrec.h, 1000 Tage x 192 B im KVStore) inkl. Regler-/Broker-Block + Regelguete; /daily neu (Paging), /daily/cur, /daily/info; Regler/Broker-/status 1x/min voll gelesen (gleiche Anfrage); Tageswechsel jetzt ueber Tagesnummer statt Minutensprung (greift auch nach Ausfall ueber Mitternacht). 1.17: grosses SoC-Feld zeigt bei Zendure-Fehlversuch/Pause den letzten Wert GRAU statt "-- %" ("-- %" nur bis zum ersten Wert). 1.16: grosses Feld oben geteilt -> links Netz gesamt [W], rechts Zendure-SoC [%] gross + farbig (rot <=40 / gelb 41-79 / gruen >=80); sonst unveraendert. 1.15: CONTROL_IO_MS 1000->1750 (Poll-Timeout): 750ms beob. Regler-Kalt-Poll-Max + 1000ms Reserve -> eliminiert falsche REGLER/CONTROL DOWN durch Netz-/Kalt-Connect-Jitter (Signal-Reinheit: Zaehler = echtes Problem). Basis 1.14 (kumulative Zustands-Zaehler). // in /status (Feld "fw"); "build" = Compile-Zeit
 #define SCREEN_W   800
 #define SCREEN_H   480
 
@@ -1066,7 +1066,9 @@ void loop() {
 #endif
 
   // Tages-Datensatz: Minuten-Takt (Zaehler, Min/Max, Zustands-Minuten; stuendlich Checkpoint in den KVStore)
-  if (now - lastDrMin >= 60000UL) { lastDrMin = now; drMinute(); }
+  // fester Minuten-Raster (+= 60 s): Loop-Verspaetung (z. B. Zendure-HTTP bis 18 s) summiert sich nicht auf;
+  // nach > 5 min Blockade neu aufsetzen statt die verpassten Minuten im Schnelldurchlauf nachzuholen
+  if (now - lastDrMin >= 60000UL) { lastDrMin = (now - lastDrMin < 300000UL) ? lastDrMin + 60000UL : now; drMinute(); }
 
   // Waechter-Anzeige: blinkender roter Rahmen + Banner bei Fehlbetrieb
   if (alarmActive) {
